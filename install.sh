@@ -4,6 +4,7 @@ set -euo pipefail
 # ============================================================
 # Setup Debian limpo:
 # Docker + Docker Compose + Traefik + Portainer Agent protegido
+# Com suporte a Cloudflare DNS Challenge
 # ============================================================
 
 STACK_DIR="/opt/stacks/traefik-portainer-agent"
@@ -64,6 +65,43 @@ ask_yes_no() {
   done
 }
 
+ask_ssl_method() {
+  local value=""
+
+  echo ""
+  echo "Escolha o método de SSL do Traefik:"
+  echo ""
+  echo "1) HTTP Challenge padrão"
+  echo "   - Mais simples"
+  echo "   - Precisa das portas 80 e 443 abertas"
+  echo "   - Não gera wildcard"
+  echo ""
+  echo "2) Cloudflare DNS Challenge"
+  echo "   - Recomendado se usa Cloudflare"
+  echo "   - Suporta wildcard"
+  echo "   - Precisa de token API da Cloudflare"
+  echo ""
+
+  while true; do
+    read -r -p "Método SSL [1/2]: " value
+    value="${value:-1}"
+
+    case "$value" in
+      1)
+        echo "http"
+        return
+        ;;
+      2)
+        echo "cloudflare"
+        return
+        ;;
+      *)
+        echo "Escolha 1 ou 2."
+        ;;
+    esac
+  done
+}
+
 echo "============================================================"
 echo " Setup: Docker + Traefik + Portainer Agent seguro"
 echo "============================================================"
@@ -72,7 +110,7 @@ echo ""
 if [ "$(id -u)" -ne 0 ]; then
   echo "ERRO: execute como root."
   echo "Use:"
-  echo "  sudo bash setup-traefik-portainer-agent.sh"
+  echo "  sudo bash install.sh"
   exit 1
 fi
 
@@ -86,6 +124,32 @@ LETSENCRYPT_EMAIL="$(ask_default "E-mail para Let's Encrypt" "$DEFAULT_LETSENCRY
 TRAEFIK_VERSION="$(ask_default "Versão do Traefik" "$DEFAULT_TRAEFIK_VERSION")"
 
 PORTAINER_AGENT_VERSION="$(ask_default "Versão do Portainer Agent" "$DEFAULT_PORTAINER_AGENT_VERSION")"
+
+SSL_METHOD="$(ask_ssl_method)"
+
+CLOUDFLARE_EMAIL=""
+CLOUDFLARE_DNS_API_TOKEN=""
+
+if [ "$SSL_METHOD" = "cloudflare" ]; then
+  echo ""
+  echo "Configuração Cloudflare DNS Challenge"
+  echo ""
+  echo "O token precisa ter permissões:"
+  echo "  Zone / Zone / Read"
+  echo "  Zone / DNS / Edit"
+  echo ""
+
+  CLOUDFLARE_EMAIL="$(ask_required "E-mail da conta Cloudflare: ")"
+
+  echo ""
+  read -r -s -p "Cloudflare DNS API Token: " CLOUDFLARE_DNS_API_TOKEN
+  echo ""
+
+  if [ -z "$CLOUDFLARE_DNS_API_TOKEN" ]; then
+    echo "ERRO: token da Cloudflare vazio."
+    exit 1
+  fi
+fi
 
 INSTALL_UFW="$(ask_yes_no "Instalar/configurar UFW?" "S")"
 
@@ -123,12 +187,22 @@ echo "Rede Docker:            $NETWORK_NAME"
 echo "Traefik:                $TRAEFIK_VERSION"
 echo "Portainer Agent:        $PORTAINER_AGENT_VERSION"
 echo "E-mail Let's Encrypt:   $LETSENCRYPT_EMAIL"
+echo "Método SSL:             $SSL_METHOD"
 echo "IP autorizado 9001:     $PORTAINER_SERVER_IP"
 echo "Configurar UFW:         $INSTALL_UFW"
 echo "Liberar SSH:            $ALLOW_SSH"
+
 if [ "$ALLOW_SSH" = "yes" ]; then
   echo "Porta SSH:              $SSH_PORT"
 fi
+
+if [ "$SSL_METHOD" = "cloudflare" ]; then
+  echo "Cloudflare:             ativado"
+  echo "Cloudflare e-mail:      $CLOUDFLARE_EMAIL"
+else
+  echo "Cloudflare:             desativado"
+fi
+
 echo "AGENT_SECRET:           gerado/definido e será salvo com permissão 600"
 echo "------------------------------------------------------------"
 echo ""
@@ -141,16 +215,16 @@ if [ "$CONTINUE_INSTALL" != "yes" ]; then
 fi
 
 echo ""
-echo "[1/10] Atualizando pacotes..."
+echo "[1/11] Atualizando pacotes..."
 apt update
-apt install -y ca-certificates curl gnupg lsb-release apt-transport-https software-properties-common openssl
+apt install -y ca-certificates curl gnupg lsb-release apt-transport-https software-properties-common openssl openssh-client iproute2
 
 echo ""
-echo "[2/10] Removendo pacotes Docker conflitantes, se existirem..."
+echo "[2/11] Removendo pacotes Docker conflitantes, se existirem..."
 apt remove -y docker.io docker-doc docker-compose podman-docker containerd runc || true
 
 echo ""
-echo "[3/10] Configurando repositório oficial do Docker..."
+echo "[3/11] Configurando repositório oficial do Docker..."
 install -m 0755 -d /etc/apt/keyrings
 
 curl -fsSL https://download.docker.com/linux/debian/gpg -o /etc/apt/keyrings/docker.asc
@@ -165,24 +239,24 @@ echo \
 apt update
 
 echo ""
-echo "[4/10] Instalando Docker Engine e Docker Compose Plugin..."
+echo "[4/11] Instalando Docker Engine e Docker Compose Plugin..."
 apt install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
 
 systemctl enable docker
 systemctl start docker
 
 echo ""
-echo "[5/10] Criando rede Docker '$NETWORK_NAME'..."
+echo "[5/11] Criando rede Docker '$NETWORK_NAME'..."
 docker network inspect "$NETWORK_NAME" >/dev/null 2>&1 || docker network create "$NETWORK_NAME"
 
 echo ""
-echo "[6/10] Criando diretórios da stack..."
+echo "[6/11] Criando diretórios da stack..."
 mkdir -p "$STACK_DIR/letsencrypt"
 touch "$STACK_DIR/letsencrypt/acme.json"
 chmod 600 "$STACK_DIR/letsencrypt/acme.json"
 
 echo ""
-echo "[7/10] Salvando variáveis protegidas..."
+echo "[7/11] Salvando variáveis protegidas..."
 cat > "$STACK_DIR/.env" <<EOF
 TRAEFIK_VERSION=$TRAEFIK_VERSION
 PORTAINER_AGENT_VERSION=$PORTAINER_AGENT_VERSION
@@ -190,6 +264,9 @@ NETWORK_NAME=$NETWORK_NAME
 LETSENCRYPT_EMAIL=$LETSENCRYPT_EMAIL
 AGENT_SECRET=$AGENT_SECRET
 PORTAINER_SERVER_IP=$PORTAINER_SERVER_IP
+SSL_METHOD=$SSL_METHOD
+CLOUDFLARE_EMAIL=$CLOUDFLARE_EMAIL
+CLOUDFLARE_DNS_API_TOKEN=$CLOUDFLARE_DNS_API_TOKEN
 EOF
 
 chmod 600 "$STACK_DIR/.env"
@@ -198,18 +275,27 @@ cat > "$AGENT_SECRET_FILE" <<EOF
 AGENT_SECRET=$AGENT_SECRET
 PORTAINER_SERVER_IP=$PORTAINER_SERVER_IP
 STACK_DIR=$STACK_DIR
+SSL_METHOD=$SSL_METHOD
+CLOUDFLARE_EMAIL=$CLOUDFLARE_EMAIL
 EOF
 
 chmod 600 "$AGENT_SECRET_FILE"
 
 echo ""
-echo "[8/10] Gerando docker-compose.yml..."
-cat > "$STACK_DIR/docker-compose.yml" <<'EOF'
+echo "[8/11] Gerando docker-compose.yml..."
+
+if [ "$SSL_METHOD" = "cloudflare" ]; then
+  cat > "$STACK_DIR/docker-compose.yml" <<'EOF'
 services:
   traefik:
     image: traefik:${TRAEFIK_VERSION}
     container_name: traefik
     restart: unless-stopped
+
+    environment:
+      - CF_DNS_API_TOKEN=${CLOUDFLARE_DNS_API_TOKEN}
+      - CLOUDFLARE_EMAIL=${CLOUDFLARE_EMAIL}
+
     command:
       - --api.dashboard=true
       - --api.insecure=false
@@ -226,6 +312,76 @@ services:
 
       - --certificatesresolvers.letsencrypt.acme.email=${LETSENCRYPT_EMAIL}
       - --certificatesresolvers.letsencrypt.acme.storage=/letsencrypt/acme.json
+
+      - --certificatesresolvers.letsencrypt.acme.dnschallenge=true
+      - --certificatesresolvers.letsencrypt.acme.dnschallenge.provider=cloudflare
+      - --certificatesresolvers.letsencrypt.acme.dnschallenge.delaybeforecheck=10
+
+      - --log.level=INFO
+      - --accesslog=true
+
+    ports:
+      - "80:80"
+      - "443:443"
+
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - ./letsencrypt:/letsencrypt
+
+    networks:
+      - proxy
+
+  portainer-agent:
+    image: portainer/agent:${PORTAINER_AGENT_VERSION}
+    container_name: portainer_agent
+    restart: unless-stopped
+
+    # Agent sem labels do Traefik.
+    # Nao expor por dominio.
+    # Acesso somente via IP:9001, protegido por firewall e AGENT_SECRET.
+    ports:
+      - "9001:9001"
+
+    environment:
+      - AGENT_SECRET=${AGENT_SECRET}
+
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - /var/lib/docker/volumes:/var/lib/docker/volumes
+
+    networks:
+      - proxy
+
+networks:
+  proxy:
+    external: true
+EOF
+
+else
+  cat > "$STACK_DIR/docker-compose.yml" <<'EOF'
+services:
+  traefik:
+    image: traefik:${TRAEFIK_VERSION}
+    container_name: traefik
+    restart: unless-stopped
+
+    command:
+      - --api.dashboard=true
+      - --api.insecure=false
+
+      - --providers.docker=true
+      - --providers.docker.exposedbydefault=false
+      - --providers.docker.network=${NETWORK_NAME}
+
+      - --entrypoints.web.address=:80
+      - --entrypoints.websecure.address=:443
+
+      - --entrypoints.web.http.redirections.entrypoint.to=websecure
+      - --entrypoints.web.http.redirections.entrypoint.scheme=https
+
+      - --certificatesresolvers.letsencrypt.acme.email=${LETSENCRYPT_EMAIL}
+      - --certificatesresolvers.letsencrypt.acme.storage=/letsencrypt/acme.json
+
       - --certificatesresolvers.letsencrypt.acme.httpchallenge=true
       - --certificatesresolvers.letsencrypt.acme.httpchallenge.entrypoint=web
 
@@ -268,14 +424,15 @@ networks:
   proxy:
     external: true
 EOF
+fi
 
 echo ""
-echo "[9/10] Subindo Traefik e Portainer Agent..."
+echo "[9/11] Subindo Traefik e Portainer Agent..."
 cd "$STACK_DIR"
 docker compose up -d
 
 echo ""
-echo "[10/10] Configurando firewall..."
+echo "[10/11] Configurando firewall..."
 
 if [ "$INSTALL_UFW" = "yes" ]; then
   if ! command -v ufw >/dev/null 2>&1; then
@@ -289,7 +446,10 @@ if [ "$INSTALL_UFW" = "yes" ]; then
   ufw allow 80/tcp || true
   ufw allow 443/tcp || true
 
+  # Remove regra aberta da porta 9001, se existir.
   ufw delete allow 9001/tcp >/dev/null 2>&1 || true
+
+  # Libera 9001 somente para o IP autorizado.
   ufw allow from "$PORTAINER_SERVER_IP" to any port 9001 proto tcp || true
 
   ufw --force enable
@@ -305,41 +465,7 @@ else
 fi
 
 echo ""
-echo "============================================================"
-echo " INSTALAÇÃO CONCLUÍDA"
-echo "============================================================"
-echo ""
-echo "Stack instalada em:"
-echo "  $STACK_DIR"
-echo ""
-echo "AGENT_SECRET salvo em:"
-echo "  $AGENT_SECRET_FILE"
-echo ""
-echo "Use este mesmo AGENT_SECRET no seu Portainer Server:"
-echo ""
-echo "  $AGENT_SECRET"
-echo ""
-echo "Endpoint para cadastrar no Portainer:"
-echo "  IP_DESTE_SERVIDOR:9001"
-echo ""
-echo "A porta 9001 foi configurada para aceitar somente:"
-echo "  $PORTAINER_SERVER_IP"
-echo ""
-echo "Containers:"
-docker ps --format "table {{.Names}}\t{{.Image}}\t{{.Status}}\t{{.Ports}}"
-echo ""
-echo "Comandos úteis:"
-echo "  cd $STACK_DIR"
-echo "  docker compose ps"
-echo "  docker compose logs -f traefik"
-echo "  docker compose logs -f portainer-agent"
-echo ""
-echo "Para ver o segredo depois:"
-echo "  cat $AGENT_SECRET_FILE"
-echo ""
-echo "IMPORTANTE:"
-echo "  Configure o mesmo AGENT_SECRET no container do Portainer Server."
-echo "============================================================"
+echo "[11/11] Testes de conexão..."
 echo ""
 echo "============================================================"
 echo " TESTES DE CONEXÃO"
@@ -429,3 +555,52 @@ else
   echo "Para testar manualmente no Portainer Server principal, rode:"
   echo "  nc -vz IP_DESTE_SERVIDOR_AGENT 9001"
 fi
+
+echo ""
+echo "============================================================"
+echo " INSTALAÇÃO CONCLUÍDA"
+echo "============================================================"
+echo ""
+echo "Stack instalada em:"
+echo "  $STACK_DIR"
+echo ""
+echo "AGENT_SECRET salvo em:"
+echo "  $AGENT_SECRET_FILE"
+echo ""
+echo "Use este mesmo AGENT_SECRET no seu Portainer Server:"
+echo ""
+echo "  $AGENT_SECRET"
+echo ""
+echo "Endpoint para cadastrar no Portainer:"
+echo "  IP_DESTE_SERVIDOR:9001"
+echo ""
+echo "A porta 9001 foi configurada para aceitar somente:"
+echo "  $PORTAINER_SERVER_IP"
+echo ""
+echo "Método SSL configurado:"
+echo "  $SSL_METHOD"
+echo ""
+
+if [ "$SSL_METHOD" = "cloudflare" ]; then
+  echo "Cloudflare DNS Challenge está ativado."
+  echo "O token foi salvo em:"
+  echo "  $STACK_DIR/.env"
+  echo ""
+fi
+
+echo "Containers:"
+docker ps --format "table {{.Names}}\t{{.Image}}\t{{.Status}}\t{{.Ports}}"
+
+echo ""
+echo "Comandos úteis:"
+echo "  cd $STACK_DIR"
+echo "  docker compose ps"
+echo "  docker compose logs -f traefik"
+echo "  docker compose logs -f portainer-agent"
+echo ""
+echo "Para ver o segredo depois:"
+echo "  cat $AGENT_SECRET_FILE"
+echo ""
+echo "IMPORTANTE:"
+echo "  Configure o mesmo AGENT_SECRET no container do Portainer Server."
+echo "============================================================"

@@ -12,7 +12,7 @@ set -euo pipefail
 # 3. Gera AGENT_SECRET
 # 4. Depois pergunta dados SSH do Portainer principal
 # 5. Detecta Swarm ou Compose no servidor principal
-# 6. Aplica AGENT_SECRET automaticamente
+# 6. Aplica AGENT_SECRET automaticamente no Portainer Server e Agents
 # 7. Valida conexão do Portainer principal para o Agent
 # ============================================================
 
@@ -376,9 +376,6 @@ services:
     container_name: portainer_agent
     restart: unless-stopped
 
-    # Agent sem labels do Traefik.
-    # Nao expor por dominio.
-    # Acesso somente via IP:9001, protegido por firewall e AGENT_SECRET.
     ports:
       - "9001:9001"
 
@@ -444,9 +441,6 @@ services:
     container_name: portainer_agent
     restart: unless-stopped
 
-    # Agent sem labels do Traefik.
-    # Nao expor por dominio.
-    # Acesso somente via IP:9001, protegido por firewall e AGENT_SECRET.
     ports:
       - "9001:9001"
 
@@ -538,7 +532,8 @@ echo "============================================================"
 echo ""
 echo "Agora informe os dados de acesso SSH ao servidor principal."
 echo "O script vai entrar nele, detectar Portainer via Swarm ou Compose,"
-echo "aplicar o AGENT_SECRET e depois validar conexão com este Agent."
+echo "aplicar o AGENT_SECRET no Portainer Server e nos Agents existentes,"
+echo "e depois validar conexão com este Agent."
 echo ""
 
 CONFIGURE_MAIN="$(ask_yes_no "Configurar automaticamente o Portainer principal agora?" "S")"
@@ -561,6 +556,7 @@ if [ "$CONFIGURE_MAIN" = "yes" ]; then
   echo "SSH principal:           $MAIN_SSH_USER@$MAIN_SERVER_IP:$MAIN_SSH_PORT"
   echo "Servidor Agent:          $AGENT_PUBLIC_IP:9001"
   echo "Detecção Portainer:      automática"
+  echo "Aplicar secret em:       Portainer Server + Agents existentes"
   echo "------------------------------------------------------------"
   echo ""
 
@@ -613,40 +609,68 @@ if ! command -v docker >/dev/null 2>&1; then
 fi
 
 SWARM_STATE="$(docker info --format '{{.Swarm.LocalNodeState}}' 2>/dev/null || echo inactive)"
-
 echo "Estado do Swarm: $SWARM_STATE"
 
 if [ "$SWARM_STATE" = "active" ]; then
   echo ""
   echo "Docker Swarm detectado."
-  echo "Procurando serviço do Portainer..."
+  echo "Procurando serviços Portainer Server e Portainer Agent..."
 
-  PORTAINER_SERVICE="$(docker service ls --format '{{.Name}} {{.Image}}' \
+  PORTAINER_SERVER_SERVICES="$(docker service ls --format '{{.Name}} {{.Image}}' \
     | grep -E 'portainer/portainer|portainer/portainer-ce|portainer/portainer-ee' \
-    | awk '{print $1}' \
-    | head -n 1)"
+    | awk '{print $1}')"
 
-  if [ -z "$PORTAINER_SERVICE" ]; then
-    echo "ERRO: não foi possível encontrar serviço Portainer no Swarm."
+  PORTAINER_AGENT_SERVICES="$(docker service ls --format '{{.Name}} {{.Image}}' \
+    | grep -E 'portainer/agent' \
+    | awk '{print $1}')"
+
+  if [ -z "$PORTAINER_SERVER_SERVICES" ]; then
+    echo "ERRO: não foi possível encontrar serviço Portainer Server no Swarm."
     echo ""
     echo "Serviços existentes:"
     docker service ls
     exit 1
   fi
 
-  echo "Serviço Portainer encontrado: $PORTAINER_SERVICE"
-  echo "Removendo AGENT_SECRET antigo, se existir..."
+  echo ""
+  echo "Serviços Portainer Server encontrados:"
+  echo "$PORTAINER_SERVER_SERVICES"
 
-  docker service update --env-rm AGENT_SECRET "$PORTAINER_SERVICE" >/dev/null 2>&1 || true
-
-  echo "Aplicando novo AGENT_SECRET..."
-
-  docker service update \
-    --env-add AGENT_SECRET="$AGENT_SECRET" \
-    "$PORTAINER_SERVICE"
+  if [ -n "$PORTAINER_AGENT_SERVICES" ]; then
+    echo ""
+    echo "Serviços Portainer Agent encontrados:"
+    echo "$PORTAINER_AGENT_SERVICES"
+  else
+    echo ""
+    echo "Nenhum serviço Portainer Agent encontrado no Swarm principal."
+  fi
 
   echo ""
-  echo "OK: AGENT_SECRET aplicado no serviço Swarm: $PORTAINER_SERVICE"
+  echo "Aplicando AGENT_SECRET nos serviços encontrados..."
+
+  for service in $PORTAINER_SERVER_SERVICES $PORTAINER_AGENT_SERVICES; do
+    echo ""
+    echo "Atualizando serviço: $service"
+
+    docker service update --env-rm AGENT_SECRET "$service" >/dev/null 2>&1 || true
+
+    docker service update \
+      --env-add AGENT_SECRET="$AGENT_SECRET" \
+      "$service"
+  done
+
+  echo ""
+  echo "Aguardando estabilização dos serviços..."
+  sleep 8
+
+  echo ""
+  echo "Status dos serviços Portainer:"
+  for service in $PORTAINER_SERVER_SERVICES $PORTAINER_AGENT_SERVICES; do
+    docker service ps "$service" --no-trunc || true
+  done
+
+  echo ""
+  echo "OK: AGENT_SECRET aplicado no Portainer Server e Agents do Swarm."
   exit 0
 fi
 
@@ -654,35 +678,43 @@ echo ""
 echo "Docker Swarm não está ativo."
 echo "Tentando detectar instalação via Docker Compose..."
 
-PORTAINER_CONTAINER="$(docker ps --format '{{.ID}} {{.Image}} {{.Names}}' \
-  | grep -E 'portainer/portainer|portainer/portainer-ce|portainer/portainer-ee' \
-  | awk '{print $1}' \
-  | head -n 1)"
+PORTAINER_CONTAINERS="$(docker ps --format '{{.ID}} {{.Image}} {{.Names}}' \
+  | grep -E 'portainer/portainer|portainer/portainer-ce|portainer/portainer-ee|portainer/agent' \
+  | awk '{print $1}')"
 
 COMPOSE_FILE=""
 COMPOSE_DIR=""
-PORTAINER_SERVICE=""
+COMPOSE_SERVICES=""
 
-if [ -n "$PORTAINER_CONTAINER" ]; then
-  echo "Container Portainer encontrado: $PORTAINER_CONTAINER"
+if [ -n "$PORTAINER_CONTAINERS" ]; then
+  echo "Containers Portainer encontrados:"
+  echo "$PORTAINER_CONTAINERS"
 
-  COMPOSE_PROJECT="$(docker inspect "$PORTAINER_CONTAINER" --format '{{ index .Config.Labels "com.docker.compose.project" }}' 2>/dev/null || true)"
-  COMPOSE_SERVICE="$(docker inspect "$PORTAINER_CONTAINER" --format '{{ index .Config.Labels "com.docker.compose.service" }}' 2>/dev/null || true)"
-  COMPOSE_WORKDIR="$(docker inspect "$PORTAINER_CONTAINER" --format '{{ index .Config.Labels "com.docker.compose.project.working_dir" }}' 2>/dev/null || true)"
-  COMPOSE_FILES="$(docker inspect "$PORTAINER_CONTAINER" --format '{{ index .Config.Labels "com.docker.compose.project.config_files" }}' 2>/dev/null || true)"
+  FIRST_CONTAINER="$(echo "$PORTAINER_CONTAINERS" | head -n 1)"
 
-  if [ -n "$COMPOSE_WORKDIR" ] && [ -n "$COMPOSE_FILES" ] && [ -n "$COMPOSE_SERVICE" ]; then
+  COMPOSE_PROJECT="$(docker inspect "$FIRST_CONTAINER" --format '{{ index .Config.Labels "com.docker.compose.project" }}' 2>/dev/null || true)"
+  COMPOSE_WORKDIR="$(docker inspect "$FIRST_CONTAINER" --format '{{ index .Config.Labels "com.docker.compose.project.working_dir" }}' 2>/dev/null || true)"
+  COMPOSE_FILES="$(docker inspect "$FIRST_CONTAINER" --format '{{ index .Config.Labels "com.docker.compose.project.config_files" }}' 2>/dev/null || true)"
+
+  if [ -n "$COMPOSE_WORKDIR" ] && [ -n "$COMPOSE_FILES" ]; then
     FIRST_COMPOSE_FILE="$(echo "$COMPOSE_FILES" | cut -d',' -f1)"
 
     if [ -f "$FIRST_COMPOSE_FILE" ]; then
       COMPOSE_FILE="$FIRST_COMPOSE_FILE"
       COMPOSE_DIR="$(dirname "$COMPOSE_FILE")"
-      PORTAINER_SERVICE="$COMPOSE_SERVICE"
     elif [ -f "$COMPOSE_WORKDIR/$FIRST_COMPOSE_FILE" ]; then
       COMPOSE_FILE="$COMPOSE_WORKDIR/$FIRST_COMPOSE_FILE"
       COMPOSE_DIR="$COMPOSE_WORKDIR"
-      PORTAINER_SERVICE="$COMPOSE_SERVICE"
     fi
+
+    for container in $PORTAINER_CONTAINERS; do
+      SERVICE_NAME="$(docker inspect "$container" --format '{{ index .Config.Labels "com.docker.compose.service" }}' 2>/dev/null || true)"
+      CONTAINER_PROJECT="$(docker inspect "$container" --format '{{ index .Config.Labels "com.docker.compose.project" }}' 2>/dev/null || true)"
+
+      if [ -n "$SERVICE_NAME" ] && [ "$CONTAINER_PROJECT" = "$COMPOSE_PROJECT" ]; then
+        COMPOSE_SERVICES="$COMPOSE_SERVICES $SERVICE_NAME"
+      fi
+    done
   fi
 fi
 
@@ -701,7 +733,7 @@ if [ -z "$COMPOSE_FILE" ]; then
         -name "*.yml" -o \
         -name "*.yaml" \
       \) 2>/dev/null | while read -r file; do
-        if grep -qE 'portainer/portainer|portainer/portainer-ce|portainer/portainer-ee' "$file"; then
+        if grep -qE 'portainer/portainer|portainer/portainer-ce|portainer/portainer-ee|portainer/agent' "$file"; then
           echo "$file"
           break
         fi
@@ -731,44 +763,54 @@ echo "  $COMPOSE_FILE"
 
 cd "$COMPOSE_DIR"
 
-if [ -z "$PORTAINER_SERVICE" ]; then
+if [ -z "$COMPOSE_SERVICES" ]; then
+  echo "Detectando serviços pelo docker compose config..."
+
   if docker compose -f "$COMPOSE_NAME" config --services >/tmp/portainer_services.txt 2>/dev/null; then
-    if grep -q '^portainer$' /tmp/portainer_services.txt; then
-      PORTAINER_SERVICE="portainer"
-    else
-      PORTAINER_SERVICE="$(grep -i 'portainer' /tmp/portainer_services.txt | head -n 1)"
-    fi
+    while read -r service; do
+      if echo "$service" | grep -qiE 'portainer|agent'; then
+        COMPOSE_SERVICES="$COMPOSE_SERVICES $service"
+      fi
+    done < /tmp/portainer_services.txt
   fi
 fi
 
-if [ -z "$PORTAINER_SERVICE" ]; then
-  echo "ERRO: não foi possível detectar o nome do serviço Portainer no Compose."
+COMPOSE_SERVICES="$(echo "$COMPOSE_SERVICES" | tr ' ' '\n' | grep -v '^$' | sort -u | tr '\n' ' ')"
+
+if [ -z "$COMPOSE_SERVICES" ]; then
+  echo "ERRO: não foi possível detectar serviços Portainer/Agent no Compose."
   echo ""
   echo "Serviços detectados:"
   cat /tmp/portainer_services.txt 2>/dev/null || true
   exit 1
 fi
 
-echo "Serviço Compose encontrado: $PORTAINER_SERVICE"
+echo "Serviços Compose que receberão AGENT_SECRET:"
+echo "$COMPOSE_SERVICES"
 
 cat > docker-compose.agent-secret.yml <<EOF
 services:
-  $PORTAINER_SERVICE:
+EOF
+
+for service in $COMPOSE_SERVICES; do
+  cat >> docker-compose.agent-secret.yml <<EOF
+  $service:
     environment:
       AGENT_SECRET: "$AGENT_SECRET"
 EOF
+done
 
 chmod 600 docker-compose.agent-secret.yml
 
 echo "Arquivo docker-compose.agent-secret.yml criado:"
 echo "  $COMPOSE_DIR/docker-compose.agent-secret.yml"
 echo ""
-echo "Aplicando configuração no Portainer Server..."
+echo "Aplicando configuração no Portainer Server e Agents..."
 
-docker compose -f "$COMPOSE_NAME" -f docker-compose.agent-secret.yml up -d "$PORTAINER_SERVICE"
+docker compose -f "$COMPOSE_NAME" -f docker-compose.agent-secret.yml up -d $COMPOSE_SERVICES
 
 echo ""
-echo "OK: AGENT_SECRET aplicado no serviço Compose: $PORTAINER_SERVICE"
+echo "OK: AGENT_SECRET aplicado nos serviços Compose: $COMPOSE_SERVICES"
 REMOTE_SCRIPT
 
     APPLY_SECRET_RESULT="$?"
@@ -777,12 +819,12 @@ REMOTE_SCRIPT
 
     if [ "$APPLY_SECRET_RESULT" = "0" ]; then
       echo ""
-      echo "OK: AGENT_SECRET aplicado automaticamente no Portainer Server principal."
+      echo "OK: AGENT_SECRET aplicado automaticamente no Portainer Server principal e Agents."
     else
       echo ""
       echo "ERRO: não foi possível aplicar automaticamente o AGENT_SECRET no Portainer Server principal."
       echo ""
-      echo "O instalador continuará para os testes, mas talvez você precise aplicar manualmente:"
+      echo "O instalador continuará para os testes, mas talvez você precise verificar manualmente:"
       echo ""
       echo "  AGENT_SECRET=$AGENT_SECRET"
     fi
@@ -861,7 +903,7 @@ fi
 if [ "$CONFIGURE_MAIN" = "yes" ]; then
   echo "Configuração automática do Portainer principal:"
   if [ "${APPLY_SECRET_RESULT:-1}" = "0" ]; then
-    echo "  OK: AGENT_SECRET aplicado automaticamente."
+    echo "  OK: AGENT_SECRET aplicado automaticamente no Portainer Server e Agents."
   else
     echo "  ATENÇÃO: falhou ou não foi confirmado."
   fi

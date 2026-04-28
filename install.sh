@@ -3,21 +3,26 @@ set -euo pipefail
 
 # ============================================================
 # Setup Debian limpo:
-# Docker + Docker Compose + Traefik + Portainer Agent protegido
+# Docker Swarm + Traefik + Portainer Agent protegido
 # Com suporte a Cloudflare DNS Challenge
 #
 # Fluxo:
 # 1. Coleta dados da instalação local
-# 2. Instala e sobe Traefik + Portainer Agent
-# 3. Gera AGENT_SECRET
-# 4. Depois pergunta dados SSH do Portainer principal
-# 5. Detecta Swarm ou Compose no servidor principal
-# 6. Aplica AGENT_SECRET automaticamente no Portainer Server e Agents
-# 7. Valida conexão do Portainer principal para o Agent
+# 2. Instala Docker
+# 3. Inicializa Docker Swarm
+# 4. Cria redes overlay proxy e public_network
+# 5. Sobe Traefik como stack Swarm
+# 6. Sobe Portainer Agent como service Swarm
+# 7. Depois pergunta dados SSH do Portainer principal
+# 8. Aplica AGENT_SECRET no Portainer Server e nos Agents existentes
+# 9. Valida conexão do principal para este Agent
 # ============================================================
 
 STACK_DIR="/opt/stacks/traefik-portainer-agent"
 NETWORK_NAME="proxy"
+PUBLIC_NETWORK_NAME="public_network"
+TRAEFIK_STACK_NAME="traefik_proxy"
+PORTAINER_AGENT_SERVICE_NAME="portainer_agent"
 
 DEFAULT_TRAEFIK_VERSION="v3"
 DEFAULT_PORTAINER_AGENT_VERSION="latest"
@@ -127,8 +132,98 @@ detect_public_ip() {
   curl -4 -fsSL https://ifconfig.me 2>/dev/null || true
 }
 
+network_has_active_endpoints() {
+  local network_name="$1"
+
+  docker network inspect "$network_name" --format '{{range .Containers}}{{.Name}} {{end}}' 2>/dev/null | grep -q '[a-zA-Z0-9]'
+}
+
+print_network_endpoints() {
+  local network_name="$1"
+
+  docker network inspect "$network_name" --format '{{range .Containers}}{{.Name}}{{"\n"}}{{end}}' 2>/dev/null || true
+}
+
+ensure_overlay_network() {
+  local network_name="$1"
+  local required="$2"
+
+  echo ""
+  echo "[Rede] Validando rede '$network_name'..."
+
+  if docker network inspect "$network_name" >/dev/null 2>&1; then
+    local driver
+    driver="$(docker network inspect "$network_name" --format '{{.Driver}}')"
+
+    if [ "$driver" = "overlay" ]; then
+      echo "OK: rede '$network_name' já existe como overlay."
+      return 0
+    fi
+
+    echo "ATENÇÃO: rede '$network_name' existe, mas está como '$driver'."
+    echo "Para Swarm, ela precisa ser 'overlay'."
+
+    if network_has_active_endpoints "$network_name"; then
+      echo ""
+      echo "A rede '$network_name' tem containers ativos, então o instalador NÃO vai remover para não quebrar serviços."
+      echo ""
+      echo "Containers conectados:"
+      print_network_endpoints "$network_name"
+      echo ""
+
+      if [ "$required" = "yes" ]; then
+        echo "ERRO: a rede '$network_name' é obrigatória como overlay para continuar."
+        echo ""
+        echo "Corrija manualmente:"
+        echo "  1. Remova/pare as stacks que usam '$network_name'"
+        echo "  2. Remova a rede:"
+        echo "     docker network rm $network_name"
+        echo "  3. Crie como overlay:"
+        echo "     docker network create --driver overlay --attachable $network_name"
+        exit 1
+      fi
+
+      echo "Aviso: '$network_name' não foi alterada."
+      return 1
+    fi
+
+    echo "A rede '$network_name' não tem endpoints ativos. Recriando como overlay..."
+    docker network rm "$network_name"
+    docker network create --driver overlay --attachable "$network_name"
+    echo "OK: rede '$network_name' criada como overlay."
+    return 0
+  fi
+
+  echo "Criando rede '$network_name' como overlay..."
+  docker network create --driver overlay --attachable "$network_name"
+  echo "OK: rede '$network_name' criada como overlay."
+  return 0
+}
+
+cleanup_old_compose_installation() {
+  echo ""
+  echo "[Limpeza] Verificando instalação antiga via Docker Compose..."
+
+  if [ -f "$STACK_DIR/docker-compose.yml" ]; then
+    echo "Encontrado docker-compose.yml antigo em $STACK_DIR."
+    echo "Derrubando stack antiga para migrar para Swarm..."
+    cd "$STACK_DIR"
+    docker compose down || true
+  fi
+
+  if docker ps -a --format '{{.Names}}' | grep -q '^traefik$'; then
+    echo "Removendo container antigo: traefik"
+    docker rm -f traefik || true
+  fi
+
+  if docker ps -a --format '{{.Names}}' | grep -q '^portainer_agent$'; then
+    echo "Removendo container antigo: portainer_agent"
+    docker rm -f portainer_agent || true
+  fi
+}
+
 echo "============================================================"
-echo " Setup: Docker + Traefik + Portainer Agent seguro"
+echo " Setup: Docker Swarm + Traefik + Portainer Agent seguro"
 echo "============================================================"
 echo ""
 
@@ -218,11 +313,13 @@ echo "Resumo da instalação local:"
 echo "------------------------------------------------------------"
 echo "Servidor Agent:          $AGENT_PUBLIC_IP"
 echo "Stack local:             $STACK_DIR"
-echo "Rede Docker:             $NETWORK_NAME"
+echo "Rede Traefik/Agent:      $NETWORK_NAME"
+echo "Rede pública padrão:     $PUBLIC_NETWORK_NAME"
 echo "Traefik:                 $TRAEFIK_VERSION"
 echo "Portainer Agent:         $PORTAINER_AGENT_VERSION"
 echo "E-mail Let's Encrypt:    $LETSENCRYPT_EMAIL"
 echo "Método SSL:              $SSL_METHOD"
+echo "Docker Swarm:            será inicializado automaticamente"
 echo "Configurar UFW:          $INSTALL_UFW"
 echo "Liberar SSH local:       $ALLOW_SSH"
 
@@ -238,6 +335,7 @@ else
   echo "SSL:                     HTTP Challenge sem Cloudflare"
 fi
 
+echo "Volumes externos:        não serão criados automaticamente"
 echo "AGENT_SECRET:            gerado/definido e será salvo com permissão 600"
 echo "------------------------------------------------------------"
 echo ""
@@ -255,16 +353,16 @@ echo " ETAPA 2: INSTALAÇÃO LOCAL"
 echo "============================================================"
 
 echo ""
-echo "[1/9] Atualizando pacotes..."
+echo "[1/10] Atualizando pacotes..."
 apt update
 apt install -y ca-certificates curl gnupg lsb-release apt-transport-https software-properties-common openssl openssh-client iproute2
 
 echo ""
-echo "[2/9] Removendo pacotes Docker conflitantes, se existirem..."
+echo "[2/10] Removendo pacotes Docker conflitantes, se existirem..."
 apt remove -y docker.io docker-doc docker-compose podman-docker containerd runc || true
 
 echo ""
-echo "[3/9] Configurando repositório oficial do Docker..."
+echo "[3/10] Configurando repositório oficial do Docker..."
 install -m 0755 -d /etc/apt/keyrings
 
 curl -fsSL https://download.docker.com/linux/debian/gpg -o /etc/apt/keyrings/docker.asc
@@ -279,28 +377,47 @@ echo \
 apt update
 
 echo ""
-echo "[4/9] Instalando Docker Engine e Docker Compose Plugin..."
+echo "[4/10] Instalando Docker Engine e Docker Compose Plugin..."
 apt install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
 
 systemctl enable docker
 systemctl start docker
 
 echo ""
-echo "[5/9] Criando rede Docker '$NETWORK_NAME'..."
-docker network inspect "$NETWORK_NAME" >/dev/null 2>&1 || docker network create "$NETWORK_NAME"
+echo "[5/10] Inicializando Docker Swarm..."
+
+SWARM_STATE="$(docker info --format '{{.Swarm.LocalNodeState}}' 2>/dev/null || echo inactive)"
+
+if [ "$SWARM_STATE" = "active" ]; then
+  echo "OK: Docker Swarm já está ativo."
+else
+  echo "Docker Swarm não está ativo. Inicializando..."
+  docker swarm init --advertise-addr "$AGENT_PUBLIC_IP"
+  echo "OK: Docker Swarm inicializado."
+fi
 
 echo ""
-echo "[6/9] Criando diretórios da stack..."
+echo "[6/10] Limpando instalação antiga, se existir..."
+cleanup_old_compose_installation
+
+echo ""
+echo "[7/10] Criando redes overlay..."
+ensure_overlay_network "$NETWORK_NAME" "yes"
+ensure_overlay_network "$PUBLIC_NETWORK_NAME" "no" || true
+
+echo ""
+echo "[8/10] Criando diretórios da stack..."
 mkdir -p "$STACK_DIR/letsencrypt"
 touch "$STACK_DIR/letsencrypt/acme.json"
 chmod 600 "$STACK_DIR/letsencrypt/acme.json"
 
 echo ""
-echo "[7/9] Salvando variáveis protegidas..."
+echo "[9/10] Salvando variáveis protegidas..."
 cat > "$STACK_DIR/.env" <<EOF
 TRAEFIK_VERSION=$TRAEFIK_VERSION
 PORTAINER_AGENT_VERSION=$PORTAINER_AGENT_VERSION
 NETWORK_NAME=$NETWORK_NAME
+PUBLIC_NETWORK_NAME=$PUBLIC_NETWORK_NAME
 LETSENCRYPT_EMAIL=$LETSENCRYPT_EMAIL
 AGENT_SECRET=$AGENT_SECRET
 AGENT_PUBLIC_IP=$AGENT_PUBLIC_IP
@@ -317,32 +434,30 @@ AGENT_PUBLIC_IP=$AGENT_PUBLIC_IP
 STACK_DIR=$STACK_DIR
 SSL_METHOD=$SSL_METHOD
 CLOUDFLARE_EMAIL=$CLOUDFLARE_EMAIL
+NETWORK_NAME=$NETWORK_NAME
+PUBLIC_NETWORK_NAME=$PUBLIC_NETWORK_NAME
 EOF
 
 chmod 600 "$AGENT_SECRET_FILE"
 
 echo ""
-echo "[8/9] Gerando docker-compose.yml..."
+echo "[10/10] Gerando stack Swarm do Traefik..."
 
 if [ "$SSL_METHOD" = "cloudflare" ]; then
-  cat > "$STACK_DIR/docker-compose.yml" <<'EOF'
+  cat > "$STACK_DIR/traefik-stack.yml" <<EOF
+version: "3.8"
+
 services:
   traefik:
     image: traefik:${TRAEFIK_VERSION}
-    container_name: traefik
-    restart: unless-stopped
-
-    environment:
-      - CLOUDFLARE_DNS_API_TOKEN=${CLOUDFLARE_DNS_API_TOKEN}
-      - CLOUDFLARE_EMAIL=${CLOUDFLARE_EMAIL}
-
     command:
       - --api.dashboard=true
       - --api.insecure=false
 
-      - --providers.docker=true
-      - --providers.docker.exposedbydefault=false
-      - --providers.docker.network=${NETWORK_NAME}
+      - --providers.swarm=true
+      - --providers.swarm.endpoint=unix:///var/run/docker.sock
+      - --providers.swarm.exposedbydefault=false
+      - --providers.swarm.network=${NETWORK_NAME}
 
       - --entrypoints.web.address=:80
       - --entrypoints.websecure.address=:443
@@ -360,55 +475,55 @@ services:
       - --log.level=INFO
       - --accesslog=true
 
+    environment:
+      - CLOUDFLARE_DNS_API_TOKEN=${CLOUDFLARE_DNS_API_TOKEN}
+      - CLOUDFLARE_EMAIL=${CLOUDFLARE_EMAIL}
+
     ports:
-      - "80:80"
-      - "443:443"
+      - target: 80
+        published: 80
+        protocol: tcp
+        mode: host
+      - target: 443
+        published: 443
+        protocol: tcp
+        mode: host
 
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock:ro
-      - ./letsencrypt:/letsencrypt
+      - ${STACK_DIR}/letsencrypt:/letsencrypt
 
     networks:
-      - proxy
+      - ${NETWORK_NAME}
 
-  portainer-agent:
-    image: portainer/agent:${PORTAINER_AGENT_VERSION}
-    container_name: portainer_agent
-    restart: unless-stopped
-
-    ports:
-      - "9001:9001"
-
-    environment:
-      - AGENT_SECRET=${AGENT_SECRET}
-
-    volumes:
-      - /var/run/docker.sock:/var/run/docker.sock
-      - /var/lib/docker/volumes:/var/lib/docker/volumes
-
-    networks:
-      - proxy
+    deploy:
+      mode: replicated
+      replicas: 1
+      placement:
+        constraints:
+          - node.role == manager
 
 networks:
-  proxy:
+  ${NETWORK_NAME}:
     external: true
+    name: ${NETWORK_NAME}
 EOF
 
 else
-  cat > "$STACK_DIR/docker-compose.yml" <<'EOF'
+  cat > "$STACK_DIR/traefik-stack.yml" <<EOF
+version: "3.8"
+
 services:
   traefik:
     image: traefik:${TRAEFIK_VERSION}
-    container_name: traefik
-    restart: unless-stopped
-
     command:
       - --api.dashboard=true
       - --api.insecure=false
 
-      - --providers.docker=true
-      - --providers.docker.exposedbydefault=false
-      - --providers.docker.network=${NETWORK_NAME}
+      - --providers.swarm=true
+      - --providers.swarm.endpoint=unix:///var/run/docker.sock
+      - --providers.swarm.exposedbydefault=false
+      - --providers.swarm.network=${NETWORK_NAME}
 
       - --entrypoints.web.address=:80
       - --entrypoints.websecure.address=:443
@@ -426,48 +541,74 @@ services:
       - --accesslog=true
 
     ports:
-      - "80:80"
-      - "443:443"
+      - target: 80
+        published: 80
+        protocol: tcp
+        mode: host
+      - target: 443
+        published: 443
+        protocol: tcp
+        mode: host
 
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock:ro
-      - ./letsencrypt:/letsencrypt
+      - ${STACK_DIR}/letsencrypt:/letsencrypt
 
     networks:
-      - proxy
+      - ${NETWORK_NAME}
 
-  portainer-agent:
-    image: portainer/agent:${PORTAINER_AGENT_VERSION}
-    container_name: portainer_agent
-    restart: unless-stopped
-
-    ports:
-      - "9001:9001"
-
-    environment:
-      - AGENT_SECRET=${AGENT_SECRET}
-
-    volumes:
-      - /var/run/docker.sock:/var/run/docker.sock
-      - /var/lib/docker/volumes:/var/lib/docker/volumes
-
-    networks:
-      - proxy
+    deploy:
+      mode: replicated
+      replicas: 1
+      placement:
+        constraints:
+          - node.role == manager
 
 networks:
-  proxy:
+  ${NETWORK_NAME}:
     external: true
+    name: ${NETWORK_NAME}
 EOF
 fi
 
 echo ""
-echo "[9/9] Subindo Traefik e Portainer Agent..."
-cd "$STACK_DIR"
-docker compose up -d
+echo "============================================================"
+echo " ETAPA 3: SUBINDO TRAEFIK E PORTAINER AGENT EM SWARM"
+echo "============================================================"
+
+echo ""
+echo "[Traefik] Deploy da stack Swarm..."
+docker stack deploy -c "$STACK_DIR/traefik-stack.yml" "$TRAEFIK_STACK_NAME"
+
+echo ""
+echo "[Portainer Agent] Recriando service Swarm..."
+
+if docker service inspect "$PORTAINER_AGENT_SERVICE_NAME" >/dev/null 2>&1; then
+  echo "Service '$PORTAINER_AGENT_SERVICE_NAME' já existe. Removendo para recriar corretamente..."
+  docker service rm "$PORTAINER_AGENT_SERVICE_NAME"
+  sleep 5
+fi
+
+docker service create \
+  --name "$PORTAINER_AGENT_SERVICE_NAME" \
+  --network "$NETWORK_NAME" \
+  --publish published=9001,target=9001,protocol=tcp,mode=host \
+  --mode global \
+  --constraint 'node.platform.os == linux' \
+  --env AGENT_CLUSTER_ADDR="tasks.${PORTAINER_AGENT_SERVICE_NAME}" \
+  --env AGENT_SECRET="$AGENT_SECRET" \
+  --mount type=bind,src=/var/run/docker.sock,dst=/var/run/docker.sock \
+  --mount type=bind,src=/var/lib/docker/volumes,dst=/var/lib/docker/volumes \
+  --mount type=bind,src=/,dst=/host \
+  "portainer/agent:${PORTAINER_AGENT_VERSION}"
+
+echo ""
+echo "Aguardando serviços iniciarem..."
+sleep 10
 
 echo ""
 echo "============================================================"
-echo " ETAPA 3: CONFIGURAÇÃO LOCAL DO FIREWALL"
+echo " ETAPA 4: CONFIGURAÇÃO LOCAL DO FIREWALL"
 echo "============================================================"
 
 if [ "$INSTALL_UFW" = "yes" ]; then
@@ -498,36 +639,61 @@ fi
 
 echo ""
 echo "============================================================"
-echo " ETAPA 4: TESTES LOCAIS"
+echo " ETAPA 5: TESTES LOCAIS"
 echo "============================================================"
 
 echo ""
-echo "[Teste local 1] Verificando se o container portainer_agent está rodando..."
+echo "[Teste local 1] Verificando serviços Swarm..."
 
-if docker ps --format '{{.Names}}' | grep -q '^portainer_agent$'; then
-  echo "OK: container portainer_agent está rodando."
+docker service ls | grep -E "${TRAEFIK_STACK_NAME}_traefik|${PORTAINER_AGENT_SERVICE_NAME}" || true
+
+echo ""
+echo "[Teste local 2] Verificando Portainer Agent..."
+
+AGENT_REPLICAS="$(docker service ls --filter name="$PORTAINER_AGENT_SERVICE_NAME" --format '{{.Replicas}}' | head -n 1 || true)"
+
+if echo "$AGENT_REPLICAS" | grep -q '1/1'; then
+  echo "OK: Portainer Agent Swarm está rodando: $AGENT_REPLICAS"
 else
-  echo "ERRO: container portainer_agent não está rodando."
-  echo "Verifique com:"
-  echo "  docker logs portainer_agent"
+  echo "ATENÇÃO: Portainer Agent pode não estar saudável: $AGENT_REPLICAS"
+  echo ""
+  echo "Logs:"
+  docker service logs --tail 80 "$PORTAINER_AGENT_SERVICE_NAME" || true
 fi
 
 echo ""
-echo "[Teste local 2] Verificando se a porta 9001 está ouvindo localmente..."
+echo "[Teste local 3] Verificando se a porta 9001 está ouvindo..."
 
 if ss -tulpn | grep -q ':9001'; then
   echo "OK: porta 9001 está ouvindo neste servidor."
 else
   echo "ERRO: porta 9001 não está ouvindo."
-  echo "Tente:"
-  echo "  cd $STACK_DIR"
-  echo "  docker compose up -d"
-  echo "  docker logs portainer_agent"
+  echo "Verifique:"
+  echo "  docker service ls"
+  echo "  docker service logs $PORTAINER_AGENT_SERVICE_NAME"
+fi
+
+echo ""
+echo "[Teste local 4] Validando redes overlay..."
+
+PROXY_DRIVER="$(docker network inspect "$NETWORK_NAME" --format '{{.Driver}}' 2>/dev/null || echo missing)"
+PUBLIC_DRIVER="$(docker network inspect "$PUBLIC_NETWORK_NAME" --format '{{.Driver}}' 2>/dev/null || echo missing)"
+
+echo "$NETWORK_NAME: $PROXY_DRIVER"
+echo "$PUBLIC_NETWORK_NAME: $PUBLIC_DRIVER"
+
+if [ "$PROXY_DRIVER" != "overlay" ]; then
+  echo "ERRO: rede '$NETWORK_NAME' não está como overlay."
+fi
+
+if [ "$PUBLIC_DRIVER" != "overlay" ]; then
+  echo "ATENÇÃO: rede '$PUBLIC_NETWORK_NAME' não está como overlay."
+  echo "Se ela já existir como bridge com containers ativos, o instalador não remove automaticamente."
 fi
 
 echo ""
 echo "============================================================"
-echo " ETAPA 5: DADOS DO PORTAINER SERVER PRINCIPAL"
+echo " ETAPA 6: DADOS DO PORTAINER SERVER PRINCIPAL"
 echo "============================================================"
 echo ""
 echo "Agora informe os dados de acesso SSH ao servidor principal."
@@ -565,7 +731,7 @@ if [ "$CONFIGURE_MAIN" = "yes" ]; then
   if [ "$CONTINUE_MAIN" = "yes" ]; then
     echo ""
     echo "============================================================"
-    echo " ETAPA 6: LIBERANDO 9001 PARA O PORTAINER PRINCIPAL"
+    echo " ETAPA 7: LIBERANDO 9001 PARA O PORTAINER PRINCIPAL"
     echo "============================================================"
 
     if [ "$INSTALL_UFW" = "yes" ]; then
@@ -586,7 +752,7 @@ if [ "$CONFIGURE_MAIN" = "yes" ]; then
 
     echo ""
     echo "============================================================"
-    echo " ETAPA 7: APLICANDO AGENT_SECRET NO PORTAINER PRINCIPAL"
+    echo " ETAPA 8: APLICANDO AGENT_SECRET NO PORTAINER PRINCIPAL"
     echo "============================================================"
     echo ""
 
@@ -831,7 +997,7 @@ REMOTE_SCRIPT
 
     echo ""
     echo "============================================================"
-    echo " ETAPA 8: VALIDANDO CONEXÃO DO PRINCIPAL PARA O AGENT"
+    echo " ETAPA 9: VALIDANDO CONEXÃO DO PRINCIPAL PARA O AGENT"
     echo "============================================================"
     echo ""
 
@@ -859,7 +1025,7 @@ REMOTE_SCRIPT
       echo "  2. IP autorizado no UFW: $MAIN_SERVER_IP"
       echo "  3. Porta 9001 no firewall da VPS/provedor"
       echo "  4. Logs do Agent:"
-      echo "     docker logs portainer_agent"
+      echo "     docker service logs $PORTAINER_AGENT_SERVICE_NAME"
       echo ""
       echo "Teste manual no Portainer principal:"
       echo "  nc -vz $AGENT_PUBLIC_IP 9001"
@@ -892,6 +1058,10 @@ echo ""
 echo "Método SSL configurado:"
 echo "  $SSL_METHOD"
 echo ""
+echo "Redes Swarm:"
+echo "  $NETWORK_NAME"
+echo "  $PUBLIC_NETWORK_NAME"
+echo ""
 
 if [ "$SSL_METHOD" = "cloudflare" ]; then
   echo "Cloudflare DNS Challenge está ativado."
@@ -918,15 +1088,20 @@ if [ "$CONFIGURE_MAIN" = "yes" ]; then
   echo ""
 fi
 
-echo "Containers locais:"
-docker ps --format "table {{.Names}}\t{{.Image}}\t{{.Status}}\t{{.Ports}}"
+echo "Serviços Swarm locais:"
+docker service ls | grep -E "${TRAEFIK_STACK_NAME}_traefik|${PORTAINER_AGENT_SERVICE_NAME}" || true
+
+echo ""
+echo "Redes Docker:"
+docker network ls | grep -E "${NETWORK_NAME}|${PUBLIC_NETWORK_NAME}|ingress" || true
 
 echo ""
 echo "Comandos úteis:"
-echo "  cd $STACK_DIR"
-echo "  docker compose ps"
-echo "  docker compose logs -f traefik"
-echo "  docker compose logs -f portainer-agent"
+echo "  docker service ls"
+echo "  docker service logs -f $PORTAINER_AGENT_SERVICE_NAME"
+echo "  docker service logs -f ${TRAEFIK_STACK_NAME}_traefik"
+echo "  docker stack ps $TRAEFIK_STACK_NAME"
+echo "  docker network ls"
 echo ""
 echo "Para ver o segredo depois:"
 echo "  cat $AGENT_SECRET_FILE"

@@ -68,19 +68,19 @@ ask_yes_no() {
 ask_ssl_method() {
   local value=""
 
-  echo ""
-  echo "Escolha o método de SSL do Traefik:"
-  echo ""
-  echo "1) HTTP Challenge padrão"
-  echo "   - Mais simples"
-  echo "   - Precisa das portas 80 e 443 abertas"
-  echo "   - Não gera wildcard"
-  echo ""
-  echo "2) Cloudflare DNS Challenge"
-  echo "   - Recomendado se usa Cloudflare"
-  echo "   - Suporta wildcard"
-  echo "   - Precisa de token API da Cloudflare"
-  echo ""
+  echo "" >&2
+  echo "Escolha o método de SSL do Traefik:" >&2
+  echo "" >&2
+  echo "1) HTTP Challenge padrão" >&2
+  echo "   - Mais simples" >&2
+  echo "   - Precisa das portas 80 e 443 abertas" >&2
+  echo "   - Não gera wildcard" >&2
+  echo "" >&2
+  echo "2) Cloudflare DNS Challenge" >&2
+  echo "   - Recomendado se usa Cloudflare" >&2
+  echo "   - Suporta wildcard" >&2
+  echo "   - Precisa de token API da Cloudflare" >&2
+  echo "" >&2
 
   while true; do
     read -r -p "Método SSL [1/2]: " value
@@ -96,7 +96,7 @@ ask_ssl_method() {
         return
         ;;
       *)
-        echo "Escolha 1 ou 2."
+        echo "Escolha 1 ou 2." >&2
         ;;
     esac
   done

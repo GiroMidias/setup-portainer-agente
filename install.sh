@@ -5,7 +5,15 @@ set -euo pipefail
 # Setup Debian limpo:
 # Docker + Docker Compose + Traefik + Portainer Agent protegido
 # Com suporte a Cloudflare DNS Challenge
-# Com aplicação automática do AGENT_SECRET no Portainer Server
+#
+# Fluxo:
+# 1. Coleta dados da instalação local
+# 2. Instala e sobe Traefik + Portainer Agent
+# 3. Gera AGENT_SECRET
+# 4. Depois pergunta dados SSH do Portainer principal
+# 5. Detecta Swarm ou Compose no servidor principal
+# 6. Aplica AGENT_SECRET automaticamente
+# 7. Valida conexão do Portainer principal para o Agent
 # ============================================================
 
 STACK_DIR="/opt/stacks/traefik-portainer-agent"
@@ -115,6 +123,10 @@ generate_secret() {
   dd if=/dev/urandom bs=32 count=1 2>/dev/null | od -An -tx1 | tr -d ' \n'
 }
 
+detect_public_ip() {
+  curl -4 -fsSL https://ifconfig.me 2>/dev/null || true
+}
+
 echo "============================================================"
 echo " Setup: Docker + Traefik + Portainer Agent seguro"
 echo "============================================================"
@@ -127,10 +139,17 @@ if [ "$(id -u)" -ne 0 ]; then
   exit 1
 fi
 
-echo "Preencha os dados da instalação."
+echo "============================================================"
+echo " ETAPA 1: DADOS DA INSTALAÇÃO LOCAL"
+echo "============================================================"
 echo ""
 
-PORTAINER_SERVER_IP="$(ask_required "IP do Portainer Server autorizado na porta 9001: ")"
+AGENT_PUBLIC_IP_DEFAULT="$(detect_public_ip)"
+if [ -z "$AGENT_PUBLIC_IP_DEFAULT" ]; then
+  AGENT_PUBLIC_IP_DEFAULT="IP_DESTE_SERVIDOR"
+fi
+
+AGENT_PUBLIC_IP="$(ask_default "IP público deste servidor Agent" "$AGENT_PUBLIC_IP_DEFAULT")"
 
 LETSENCRYPT_EMAIL="$(ask_default "E-mail para Let's Encrypt" "$DEFAULT_LETSENCRYPT_EMAIL")"
 
@@ -174,7 +193,7 @@ if [ "$INSTALL_UFW" = "yes" ]; then
   ALLOW_SSH="$(ask_yes_no "Liberar acesso SSH no firewall?" "S")"
 
   if [ "$ALLOW_SSH" = "yes" ]; then
-    SSH_PORT="$(ask_default "Porta SSH para liberar" "$DEFAULT_SSH_PORT")"
+    SSH_PORT="$(ask_default "Porta SSH local para liberar" "$DEFAULT_SSH_PORT")"
   fi
 fi
 
@@ -195,69 +214,35 @@ else
 fi
 
 echo ""
-AUTO_APPLY_SECRET_MAIN="$(ask_yes_no "Aplicar AGENT_SECRET automaticamente no Portainer Server principal via SSH?" "S")"
-
-MAIN_SSH_USER="root"
-MAIN_SSH_PORT="22"
-MAIN_PORTAINER_DIR=""
-MAIN_PORTAINER_SERVICE="portainer"
-MAIN_PORTAINER_COMPOSE_FILE="docker-compose.yml"
-
-if [ "$AUTO_APPLY_SECRET_MAIN" = "yes" ]; then
-  echo ""
-  echo "Configuração automática do Portainer Server principal"
-  echo ""
-  echo "O instalador vai acessar o servidor principal via SSH,"
-  echo "criar um arquivo docker-compose.agent-secret.yml"
-  echo "e recriar o serviço do Portainer com o mesmo AGENT_SECRET."
-  echo ""
-
-  MAIN_SSH_USER="$(ask_default "Usuário SSH do Portainer Server principal" "root")"
-  MAIN_SSH_PORT="$(ask_default "Porta SSH do Portainer Server principal" "22")"
-  MAIN_PORTAINER_DIR="$(ask_required "Pasta onde está o docker-compose.yml do Portainer principal: ")"
-  MAIN_PORTAINER_SERVICE="$(ask_default "Nome do serviço do Portainer no compose" "portainer")"
-  MAIN_PORTAINER_COMPOSE_FILE="$(ask_default "Nome do arquivo compose principal" "docker-compose.yml")"
-fi
-
-echo ""
-echo "Resumo da instalação:"
+echo "Resumo da instalação local:"
 echo "------------------------------------------------------------"
-echo "Stack:                  $STACK_DIR"
-echo "Rede Docker:            $NETWORK_NAME"
-echo "Traefik:                $TRAEFIK_VERSION"
-echo "Portainer Agent:        $PORTAINER_AGENT_VERSION"
-echo "E-mail Let's Encrypt:   $LETSENCRYPT_EMAIL"
-echo "Método SSL:             $SSL_METHOD"
-echo "IP autorizado 9001:     $PORTAINER_SERVER_IP"
-echo "Configurar UFW:         $INSTALL_UFW"
-echo "Liberar SSH:            $ALLOW_SSH"
+echo "Servidor Agent:          $AGENT_PUBLIC_IP"
+echo "Stack local:             $STACK_DIR"
+echo "Rede Docker:             $NETWORK_NAME"
+echo "Traefik:                 $TRAEFIK_VERSION"
+echo "Portainer Agent:         $PORTAINER_AGENT_VERSION"
+echo "E-mail Let's Encrypt:    $LETSENCRYPT_EMAIL"
+echo "Método SSL:              $SSL_METHOD"
+echo "Configurar UFW:          $INSTALL_UFW"
+echo "Liberar SSH local:       $ALLOW_SSH"
 
 if [ "$ALLOW_SSH" = "yes" ]; then
-  echo "Porta SSH:              $SSH_PORT"
+  echo "Porta SSH local:         $SSH_PORT"
 fi
 
 if [ "$SSL_METHOD" = "cloudflare" ]; then
-  echo "Cloudflare:             ativado"
-  echo "Cloudflare e-mail:      $CLOUDFLARE_EMAIL"
+  echo "Cloudflare:              ativado"
+  echo "Cloudflare e-mail:       $CLOUDFLARE_EMAIL"
 else
-  echo "Cloudflare:             desativado"
-  echo "SSL:                    HTTP Challenge sem Cloudflare"
+  echo "Cloudflare:              desativado"
+  echo "SSL:                     HTTP Challenge sem Cloudflare"
 fi
 
-echo "Aplicar secret principal: $AUTO_APPLY_SECRET_MAIN"
-
-if [ "$AUTO_APPLY_SECRET_MAIN" = "yes" ]; then
-  echo "SSH principal:           $MAIN_SSH_USER@$PORTAINER_SERVER_IP:$MAIN_SSH_PORT"
-  echo "Pasta Portainer:         $MAIN_PORTAINER_DIR"
-  echo "Arquivo compose:         $MAIN_PORTAINER_COMPOSE_FILE"
-  echo "Serviço Portainer:       $MAIN_PORTAINER_SERVICE"
-fi
-
-echo "AGENT_SECRET:           gerado/definido e será salvo com permissão 600"
+echo "AGENT_SECRET:            gerado/definido e será salvo com permissão 600"
 echo "------------------------------------------------------------"
 echo ""
 
-CONTINUE_INSTALL="$(ask_yes_no "Continuar instalação?" "S")"
+CONTINUE_INSTALL="$(ask_yes_no "Continuar instalação local?" "S")"
 
 if [ "$CONTINUE_INSTALL" != "yes" ]; then
   echo "Instalação cancelada."
@@ -265,16 +250,21 @@ if [ "$CONTINUE_INSTALL" != "yes" ]; then
 fi
 
 echo ""
-echo "[1/12] Atualizando pacotes..."
+echo "============================================================"
+echo " ETAPA 2: INSTALAÇÃO LOCAL"
+echo "============================================================"
+
+echo ""
+echo "[1/9] Atualizando pacotes..."
 apt update
 apt install -y ca-certificates curl gnupg lsb-release apt-transport-https software-properties-common openssl openssh-client iproute2
 
 echo ""
-echo "[2/12] Removendo pacotes Docker conflitantes, se existirem..."
+echo "[2/9] Removendo pacotes Docker conflitantes, se existirem..."
 apt remove -y docker.io docker-doc docker-compose podman-docker containerd runc || true
 
 echo ""
-echo "[3/12] Configurando repositório oficial do Docker..."
+echo "[3/9] Configurando repositório oficial do Docker..."
 install -m 0755 -d /etc/apt/keyrings
 
 curl -fsSL https://download.docker.com/linux/debian/gpg -o /etc/apt/keyrings/docker.asc
@@ -289,31 +279,31 @@ echo \
 apt update
 
 echo ""
-echo "[4/12] Instalando Docker Engine e Docker Compose Plugin..."
+echo "[4/9] Instalando Docker Engine e Docker Compose Plugin..."
 apt install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
 
 systemctl enable docker
 systemctl start docker
 
 echo ""
-echo "[5/12] Criando rede Docker '$NETWORK_NAME'..."
+echo "[5/9] Criando rede Docker '$NETWORK_NAME'..."
 docker network inspect "$NETWORK_NAME" >/dev/null 2>&1 || docker network create "$NETWORK_NAME"
 
 echo ""
-echo "[6/12] Criando diretórios da stack..."
+echo "[6/9] Criando diretórios da stack..."
 mkdir -p "$STACK_DIR/letsencrypt"
 touch "$STACK_DIR/letsencrypt/acme.json"
 chmod 600 "$STACK_DIR/letsencrypt/acme.json"
 
 echo ""
-echo "[7/12] Salvando variáveis protegidas..."
+echo "[7/9] Salvando variáveis protegidas..."
 cat > "$STACK_DIR/.env" <<EOF
 TRAEFIK_VERSION=$TRAEFIK_VERSION
 PORTAINER_AGENT_VERSION=$PORTAINER_AGENT_VERSION
 NETWORK_NAME=$NETWORK_NAME
 LETSENCRYPT_EMAIL=$LETSENCRYPT_EMAIL
 AGENT_SECRET=$AGENT_SECRET
-PORTAINER_SERVER_IP=$PORTAINER_SERVER_IP
+AGENT_PUBLIC_IP=$AGENT_PUBLIC_IP
 SSL_METHOD=$SSL_METHOD
 CLOUDFLARE_EMAIL=$CLOUDFLARE_EMAIL
 CLOUDFLARE_DNS_API_TOKEN=$CLOUDFLARE_DNS_API_TOKEN
@@ -323,7 +313,7 @@ chmod 600 "$STACK_DIR/.env"
 
 cat > "$AGENT_SECRET_FILE" <<EOF
 AGENT_SECRET=$AGENT_SECRET
-PORTAINER_SERVER_IP=$PORTAINER_SERVER_IP
+AGENT_PUBLIC_IP=$AGENT_PUBLIC_IP
 STACK_DIR=$STACK_DIR
 SSL_METHOD=$SSL_METHOD
 CLOUDFLARE_EMAIL=$CLOUDFLARE_EMAIL
@@ -332,84 +322,7 @@ EOF
 chmod 600 "$AGENT_SECRET_FILE"
 
 echo ""
-echo "[8/12] Aplicando AGENT_SECRET no Portainer Server principal..."
-
-if [ "$AUTO_APPLY_SECRET_MAIN" = "yes" ]; then
-  echo ""
-  echo "============================================================"
-  echo " APLICANDO AGENT_SECRET NO PORTAINER SERVER PRINCIPAL"
-  echo "============================================================"
-  echo ""
-  echo "Servidor principal: $MAIN_SSH_USER@$PORTAINER_SERVER_IP"
-  echo "Pasta do compose:   $MAIN_PORTAINER_DIR"
-  echo "Arquivo compose:    $MAIN_PORTAINER_COMPOSE_FILE"
-  echo "Serviço Portainer:  $MAIN_PORTAINER_SERVICE"
-  echo ""
-
-  set +e
-
-  ssh -p "$MAIN_SSH_PORT" \
-    -o ConnectTimeout=10 \
-    -o StrictHostKeyChecking=accept-new \
-    "$MAIN_SSH_USER@$PORTAINER_SERVER_IP" \
-    bash -s -- "$MAIN_PORTAINER_DIR" "$MAIN_PORTAINER_COMPOSE_FILE" "$MAIN_PORTAINER_SERVICE" "$AGENT_SECRET" <<'REMOTE_SCRIPT'
-set -e
-
-MAIN_PORTAINER_DIR="$1"
-MAIN_PORTAINER_COMPOSE_FILE="$2"
-MAIN_PORTAINER_SERVICE="$3"
-AGENT_SECRET="$4"
-
-cd "$MAIN_PORTAINER_DIR"
-
-if [ ! -f "$MAIN_PORTAINER_COMPOSE_FILE" ]; then
-  echo "ERRO: arquivo $MAIN_PORTAINER_COMPOSE_FILE não encontrado em $MAIN_PORTAINER_DIR"
-  exit 1
-fi
-
-cat > docker-compose.agent-secret.yml <<EOF
-services:
-  $MAIN_PORTAINER_SERVICE:
-    environment:
-      - AGENT_SECRET=$AGENT_SECRET
-EOF
-
-chmod 600 docker-compose.agent-secret.yml
-
-echo "Arquivo docker-compose.agent-secret.yml criado."
-echo "Aplicando configuração no Portainer Server..."
-
-docker compose -f "$MAIN_PORTAINER_COMPOSE_FILE" -f docker-compose.agent-secret.yml up -d "$MAIN_PORTAINER_SERVICE"
-
-echo "AGENT_SECRET aplicado no Portainer Server principal."
-REMOTE_SCRIPT
-
-  APPLY_SECRET_RESULT="$?"
-
-  set -e
-
-  if [ "$APPLY_SECRET_RESULT" = "0" ]; then
-    echo ""
-    echo "OK: AGENT_SECRET aplicado automaticamente no Portainer Server principal."
-  else
-    echo ""
-    echo "ERRO: não foi possível aplicar o AGENT_SECRET automaticamente no Portainer Server principal."
-    echo ""
-    echo "Você ainda pode aplicar manualmente usando:"
-    echo ""
-    echo "  AGENT_SECRET=$AGENT_SECRET"
-    echo ""
-    echo "Ou acessar o servidor principal e rodar:"
-    echo ""
-    echo "  cd $MAIN_PORTAINER_DIR"
-    echo "  docker compose -f $MAIN_PORTAINER_COMPOSE_FILE -f docker-compose.agent-secret.yml up -d $MAIN_PORTAINER_SERVICE"
-  fi
-else
-  echo "Aplicação automática ignorada por escolha do usuário."
-fi
-
-echo ""
-echo "[9/12] Gerando docker-compose.yml..."
+echo "[8/9] Gerando docker-compose.yml..."
 
 if [ "$SSL_METHOD" = "cloudflare" ]; then
   cat > "$STACK_DIR/docker-compose.yml" <<'EOF'
@@ -554,12 +467,14 @@ EOF
 fi
 
 echo ""
-echo "[10/12] Subindo Traefik e Portainer Agent..."
+echo "[9/9] Subindo Traefik e Portainer Agent..."
 cd "$STACK_DIR"
 docker compose up -d
 
 echo ""
-echo "[11/12] Configurando firewall..."
+echo "============================================================"
+echo " ETAPA 3: CONFIGURAÇÃO LOCAL DO FIREWALL"
+echo "============================================================"
 
 if [ "$INSTALL_UFW" = "yes" ]; then
   if ! command -v ufw >/dev/null 2>&1; then
@@ -573,11 +488,9 @@ if [ "$INSTALL_UFW" = "yes" ]; then
   ufw allow 80/tcp || true
   ufw allow 443/tcp || true
 
-  # Remove regra aberta da porta 9001, se existir.
-  ufw delete allow 9001/tcp >/dev/null 2>&1 || true
-
-  # Libera 9001 somente para o IP autorizado.
-  ufw allow from "$PORTAINER_SERVER_IP" to any port 9001 proto tcp || true
+  echo ""
+  echo "A porta 9001 será liberada depois que o IP do Portainer principal for informado."
+  echo ""
 
   ufw --force enable
 
@@ -587,19 +500,15 @@ if [ "$INSTALL_UFW" = "yes" ]; then
 else
   echo "Configuração do UFW ignorada por escolha do usuário."
   echo "ATENÇÃO: proteja manualmente a porta 9001."
-  echo "Regra recomendada:"
-  echo "  ufw allow from $PORTAINER_SERVER_IP to any port 9001 proto tcp"
 fi
 
 echo ""
-echo "[12/12] Testes de conexão..."
-echo ""
 echo "============================================================"
-echo " TESTES DE CONEXÃO"
+echo " ETAPA 4: TESTES LOCAIS"
 echo "============================================================"
 
 echo ""
-echo "[Teste 1] Verificando se o container portainer_agent está rodando..."
+echo "[Teste local 1] Verificando se o container portainer_agent está rodando..."
 
 if docker ps --format '{{.Names}}' | grep -q '^portainer_agent$'; then
   echo "OK: container portainer_agent está rodando."
@@ -610,7 +519,7 @@ else
 fi
 
 echo ""
-echo "[Teste 2] Verificando se a porta 9001 está ouvindo localmente..."
+echo "[Teste local 2] Verificando se a porta 9001 está ouvindo localmente..."
 
 if ss -tulpn | grep -q ':9001'; then
   echo "OK: porta 9001 está ouvindo neste servidor."
@@ -623,64 +532,301 @@ else
 fi
 
 echo ""
-echo "[Teste 3] Teste real a partir do Portainer Server principal"
+echo "============================================================"
+echo " ETAPA 5: DADOS DO PORTAINER SERVER PRINCIPAL"
+echo "============================================================"
 echo ""
-echo "Esse teste usa SSH para entrar no Portainer Server principal"
-echo "e de lá testar conexão com este Agent na porta 9001."
+echo "Agora informe os dados de acesso SSH ao servidor principal."
+echo "O script vai entrar nele, detectar Portainer via Swarm ou Compose,"
+echo "aplicar o AGENT_SECRET e depois validar conexão com este Agent."
 echo ""
 
-REMOTE_TEST="$(ask_yes_no "Deseja testar via SSH a partir do Portainer Server principal?" "S")"
+CONFIGURE_MAIN="$(ask_yes_no "Configurar automaticamente o Portainer principal agora?" "S")"
 
-if [ "$REMOTE_TEST" = "yes" ]; then
-  AGENT_PUBLIC_IP="$(ask_required "IP público deste servidor Agent: ")"
-  SSH_USER_MAIN="$(ask_default "Usuário SSH do Portainer Server principal" "$MAIN_SSH_USER")"
-  SSH_PORT_MAIN="$(ask_default "Porta SSH do Portainer Server principal" "$MAIN_SSH_PORT")"
+MAIN_SERVER_IP=""
+MAIN_SSH_USER="root"
+MAIN_SSH_PORT="22"
+APPLY_SECRET_RESULT="1"
+REMOTE_TEST_RESULT="1"
+
+if [ "$CONFIGURE_MAIN" = "yes" ]; then
+  MAIN_SERVER_IP="$(ask_required "IP do Portainer Server principal: ")"
+  MAIN_SSH_USER="$(ask_default "Usuário SSH do Portainer Server principal" "root")"
+  MAIN_SSH_PORT="$(ask_default "Porta SSH do Portainer Server principal" "22")"
 
   echo ""
-  echo "Testando conexão remota:"
-  echo "  Origem:  $SSH_USER_MAIN@$PORTAINER_SERVER_IP"
-  echo "  Destino: $AGENT_PUBLIC_IP:9001"
+  echo "Resumo da configuração do servidor principal:"
+  echo "------------------------------------------------------------"
+  echo "Portainer principal:     $MAIN_SERVER_IP"
+  echo "SSH principal:           $MAIN_SSH_USER@$MAIN_SERVER_IP:$MAIN_SSH_PORT"
+  echo "Servidor Agent:          $AGENT_PUBLIC_IP:9001"
+  echo "Detecção Portainer:      automática"
+  echo "------------------------------------------------------------"
   echo ""
 
-  set +e
+  CONTINUE_MAIN="$(ask_yes_no "Continuar configuração do Portainer principal?" "S")"
 
-  ssh -p "$SSH_PORT_MAIN" \
-    -o ConnectTimeout=10 \
-    -o StrictHostKeyChecking=accept-new \
-    "$SSH_USER_MAIN@$PORTAINER_SERVER_IP" \
-    "command -v nc >/dev/null 2>&1 || (apt update && apt install -y netcat-openbsd); nc -vz $AGENT_PUBLIC_IP 9001"
-
-  REMOTE_TEST_RESULT="$?"
-
-  set -e
-
-  if [ "$REMOTE_TEST_RESULT" = "0" ]; then
+  if [ "$CONTINUE_MAIN" = "yes" ]; then
     echo ""
-    echo "OK: o Portainer Server principal consegue acessar o Agent na porta 9001."
+    echo "============================================================"
+    echo " ETAPA 6: LIBERANDO 9001 PARA O PORTAINER PRINCIPAL"
+    echo "============================================================"
+
+    if [ "$INSTALL_UFW" = "yes" ]; then
+      ufw delete allow 9001/tcp >/dev/null 2>&1 || true
+      ufw allow from "$MAIN_SERVER_IP" to any port 9001 proto tcp || true
+
+      echo ""
+      echo "Porta 9001 liberada somente para:"
+      echo "  $MAIN_SERVER_IP"
+      echo ""
+
+      ufw status numbered || true
+    else
+      echo "UFW não foi configurado pelo instalador."
+      echo "Regra recomendada:"
+      echo "  ufw allow from $MAIN_SERVER_IP to any port 9001 proto tcp"
+    fi
+
+    echo ""
+    echo "============================================================"
+    echo " ETAPA 7: APLICANDO AGENT_SECRET NO PORTAINER PRINCIPAL"
+    echo "============================================================"
+    echo ""
+
+    set +e
+
+    ssh -p "$MAIN_SSH_PORT" \
+      -o ConnectTimeout=10 \
+      -o StrictHostKeyChecking=accept-new \
+      "$MAIN_SSH_USER@$MAIN_SERVER_IP" \
+      bash -s -- "$AGENT_SECRET" <<'REMOTE_SCRIPT'
+set -e
+
+AGENT_SECRET="$1"
+
+echo "Detectando ambiente Docker..."
+
+if ! command -v docker >/dev/null 2>&1; then
+  echo "ERRO: Docker não encontrado no servidor principal."
+  exit 1
+fi
+
+SWARM_STATE="$(docker info --format '{{.Swarm.LocalNodeState}}' 2>/dev/null || echo inactive)"
+
+echo "Estado do Swarm: $SWARM_STATE"
+
+if [ "$SWARM_STATE" = "active" ]; then
+  echo ""
+  echo "Docker Swarm detectado."
+  echo "Procurando serviço do Portainer..."
+
+  PORTAINER_SERVICE="$(docker service ls --format '{{.Name}} {{.Image}}' \
+    | grep -E 'portainer/portainer|portainer/portainer-ce|portainer/portainer-ee' \
+    | awk '{print $1}' \
+    | head -n 1)"
+
+  if [ -z "$PORTAINER_SERVICE" ]; then
+    echo "ERRO: não foi possível encontrar serviço Portainer no Swarm."
+    echo ""
+    echo "Serviços existentes:"
+    docker service ls
+    exit 1
+  fi
+
+  echo "Serviço Portainer encontrado: $PORTAINER_SERVICE"
+  echo "Removendo AGENT_SECRET antigo, se existir..."
+
+  docker service update --env-rm AGENT_SECRET "$PORTAINER_SERVICE" >/dev/null 2>&1 || true
+
+  echo "Aplicando novo AGENT_SECRET..."
+
+  docker service update \
+    --env-add AGENT_SECRET="$AGENT_SECRET" \
+    "$PORTAINER_SERVICE"
+
+  echo ""
+  echo "OK: AGENT_SECRET aplicado no serviço Swarm: $PORTAINER_SERVICE"
+  exit 0
+fi
+
+echo ""
+echo "Docker Swarm não está ativo."
+echo "Tentando detectar instalação via Docker Compose..."
+
+PORTAINER_CONTAINER="$(docker ps --format '{{.ID}} {{.Image}} {{.Names}}' \
+  | grep -E 'portainer/portainer|portainer/portainer-ce|portainer/portainer-ee' \
+  | awk '{print $1}' \
+  | head -n 1)"
+
+COMPOSE_FILE=""
+COMPOSE_DIR=""
+PORTAINER_SERVICE=""
+
+if [ -n "$PORTAINER_CONTAINER" ]; then
+  echo "Container Portainer encontrado: $PORTAINER_CONTAINER"
+
+  COMPOSE_PROJECT="$(docker inspect "$PORTAINER_CONTAINER" --format '{{ index .Config.Labels "com.docker.compose.project" }}' 2>/dev/null || true)"
+  COMPOSE_SERVICE="$(docker inspect "$PORTAINER_CONTAINER" --format '{{ index .Config.Labels "com.docker.compose.service" }}' 2>/dev/null || true)"
+  COMPOSE_WORKDIR="$(docker inspect "$PORTAINER_CONTAINER" --format '{{ index .Config.Labels "com.docker.compose.project.working_dir" }}' 2>/dev/null || true)"
+  COMPOSE_FILES="$(docker inspect "$PORTAINER_CONTAINER" --format '{{ index .Config.Labels "com.docker.compose.project.config_files" }}' 2>/dev/null || true)"
+
+  if [ -n "$COMPOSE_WORKDIR" ] && [ -n "$COMPOSE_FILES" ] && [ -n "$COMPOSE_SERVICE" ]; then
+    FIRST_COMPOSE_FILE="$(echo "$COMPOSE_FILES" | cut -d',' -f1)"
+
+    if [ -f "$FIRST_COMPOSE_FILE" ]; then
+      COMPOSE_FILE="$FIRST_COMPOSE_FILE"
+      COMPOSE_DIR="$(dirname "$COMPOSE_FILE")"
+      PORTAINER_SERVICE="$COMPOSE_SERVICE"
+    elif [ -f "$COMPOSE_WORKDIR/$FIRST_COMPOSE_FILE" ]; then
+      COMPOSE_FILE="$COMPOSE_WORKDIR/$FIRST_COMPOSE_FILE"
+      COMPOSE_DIR="$COMPOSE_WORKDIR"
+      PORTAINER_SERVICE="$COMPOSE_SERVICE"
+    fi
+  fi
+fi
+
+if [ -z "$COMPOSE_FILE" ]; then
+  echo "Não foi possível detectar pelo container. Buscando arquivos compose..."
+
+  SEARCH_DIRS="/root /opt /srv /home"
+
+  for dir in $SEARCH_DIRS; do
+    if [ -d "$dir" ]; then
+      FOUND_FILE="$(find "$dir" -maxdepth 5 -type f \( \
+        -name "docker-compose.yml" -o \
+        -name "docker-compose.yaml" -o \
+        -name "compose.yml" -o \
+        -name "compose.yaml" -o \
+        -name "*.yml" -o \
+        -name "*.yaml" \
+      \) 2>/dev/null | while read -r file; do
+        if grep -qE 'portainer/portainer|portainer/portainer-ce|portainer/portainer-ee' "$file"; then
+          echo "$file"
+          break
+        fi
+      done)"
+
+      if [ -n "$FOUND_FILE" ]; then
+        COMPOSE_FILE="$FOUND_FILE"
+        COMPOSE_DIR="$(dirname "$COMPOSE_FILE")"
+        break
+      fi
+    fi
+  done
+fi
+
+if [ -z "$COMPOSE_FILE" ]; then
+  echo "ERRO: não foi possível encontrar arquivo compose com Portainer."
+  echo ""
+  echo "Dica manual:"
+  echo "  find / -type f \( -name '*.yml' -o -name '*.yaml' \) 2>/dev/null | xargs grep -l 'portainer/portainer'"
+  exit 1
+fi
+
+COMPOSE_NAME="$(basename "$COMPOSE_FILE")"
+
+echo "Arquivo compose encontrado:"
+echo "  $COMPOSE_FILE"
+
+cd "$COMPOSE_DIR"
+
+if [ -z "$PORTAINER_SERVICE" ]; then
+  if docker compose -f "$COMPOSE_NAME" config --services >/tmp/portainer_services.txt 2>/dev/null; then
+    if grep -q '^portainer$' /tmp/portainer_services.txt; then
+      PORTAINER_SERVICE="portainer"
+    else
+      PORTAINER_SERVICE="$(grep -i 'portainer' /tmp/portainer_services.txt | head -n 1)"
+    fi
+  fi
+fi
+
+if [ -z "$PORTAINER_SERVICE" ]; then
+  echo "ERRO: não foi possível detectar o nome do serviço Portainer no Compose."
+  echo ""
+  echo "Serviços detectados:"
+  cat /tmp/portainer_services.txt 2>/dev/null || true
+  exit 1
+fi
+
+echo "Serviço Compose encontrado: $PORTAINER_SERVICE"
+
+cat > docker-compose.agent-secret.yml <<EOF
+services:
+  $PORTAINER_SERVICE:
+    environment:
+      AGENT_SECRET: "$AGENT_SECRET"
+EOF
+
+chmod 600 docker-compose.agent-secret.yml
+
+echo "Arquivo docker-compose.agent-secret.yml criado:"
+echo "  $COMPOSE_DIR/docker-compose.agent-secret.yml"
+echo ""
+echo "Aplicando configuração no Portainer Server..."
+
+docker compose -f "$COMPOSE_NAME" -f docker-compose.agent-secret.yml up -d "$PORTAINER_SERVICE"
+
+echo ""
+echo "OK: AGENT_SECRET aplicado no serviço Compose: $PORTAINER_SERVICE"
+REMOTE_SCRIPT
+
+    APPLY_SECRET_RESULT="$?"
+
+    set -e
+
+    if [ "$APPLY_SECRET_RESULT" = "0" ]; then
+      echo ""
+      echo "OK: AGENT_SECRET aplicado automaticamente no Portainer Server principal."
+    else
+      echo ""
+      echo "ERRO: não foi possível aplicar automaticamente o AGENT_SECRET no Portainer Server principal."
+      echo ""
+      echo "O instalador continuará para os testes, mas talvez você precise aplicar manualmente:"
+      echo ""
+      echo "  AGENT_SECRET=$AGENT_SECRET"
+    fi
+
+    echo ""
+    echo "============================================================"
+    echo " ETAPA 8: VALIDANDO CONEXÃO DO PRINCIPAL PARA O AGENT"
+    echo "============================================================"
+    echo ""
+
+    set +e
+
+    ssh -p "$MAIN_SSH_PORT" \
+      -o ConnectTimeout=10 \
+      -o StrictHostKeyChecking=accept-new \
+      "$MAIN_SSH_USER@$MAIN_SERVER_IP" \
+      "command -v nc >/dev/null 2>&1 || (apt update && apt install -y netcat-openbsd); nc -vz $AGENT_PUBLIC_IP 9001"
+
+    REMOTE_TEST_RESULT="$?"
+
+    set -e
+
+    if [ "$REMOTE_TEST_RESULT" = "0" ]; then
+      echo ""
+      echo "OK: o Portainer Server principal consegue acessar o Agent na porta 9001."
+    else
+      echo ""
+      echo "ERRO: o Portainer Server principal não conseguiu acessar o Agent."
+      echo ""
+      echo "Verifique:"
+      echo "  1. IP público do Agent: $AGENT_PUBLIC_IP"
+      echo "  2. IP autorizado no UFW: $MAIN_SERVER_IP"
+      echo "  3. Porta 9001 no firewall da VPS/provedor"
+      echo "  4. Logs do Agent:"
+      echo "     docker logs portainer_agent"
+      echo ""
+      echo "Teste manual no Portainer principal:"
+      echo "  nc -vz $AGENT_PUBLIC_IP 9001"
+    fi
   else
-    echo ""
-    echo "ERRO: o Portainer Server principal não conseguiu acessar o Agent."
-    echo ""
-    echo "Correção mais comum:"
-    echo "  sudo ufw delete allow 9001/tcp"
-    echo "  sudo ufw allow from $PORTAINER_SERVER_IP to any port 9001 proto tcp"
-    echo ""
-    echo "Confira as regras:"
-    echo "  sudo ufw status numbered"
-    echo ""
-    echo "Confira se o Agent está rodando:"
-    echo "  docker ps"
-    echo "  docker logs portainer_agent"
-    echo ""
-    echo "Teste manual no Portainer principal:"
-    echo "  nc -vz $AGENT_PUBLIC_IP 9001"
+    echo "Configuração do Portainer principal cancelada."
   fi
 else
-  echo ""
-  echo "Teste remoto ignorado."
-  echo ""
-  echo "Para testar manualmente no Portainer Server principal, rode:"
-  echo "  nc -vz IP_DESTE_SERVIDOR_AGENT 9001"
+  echo "Configuração do Portainer principal ignorada."
 fi
 
 echo ""
@@ -688,7 +834,7 @@ echo "============================================================"
 echo " INSTALAÇÃO CONCLUÍDA"
 echo "============================================================"
 echo ""
-echo "Stack instalada em:"
+echo "Stack local instalada em:"
 echo "  $STACK_DIR"
 echo ""
 echo "AGENT_SECRET salvo em:"
@@ -699,10 +845,7 @@ echo ""
 echo "  $AGENT_SECRET"
 echo ""
 echo "Endpoint para cadastrar no Portainer:"
-echo "  IP_DESTE_SERVIDOR:9001"
-echo ""
-echo "A porta 9001 foi configurada para aceitar somente:"
-echo "  $PORTAINER_SERVER_IP"
+echo "  $AGENT_PUBLIC_IP:9001"
 echo ""
 echo "Método SSL configurado:"
 echo "  $SSL_METHOD"
@@ -715,17 +858,25 @@ if [ "$SSL_METHOD" = "cloudflare" ]; then
   echo ""
 fi
 
-if [ "$AUTO_APPLY_SECRET_MAIN" = "yes" ]; then
-  echo "Aplicação automática no Portainer Server principal:"
+if [ "$CONFIGURE_MAIN" = "yes" ]; then
+  echo "Configuração automática do Portainer principal:"
   if [ "${APPLY_SECRET_RESULT:-1}" = "0" ]; then
     echo "  OK: AGENT_SECRET aplicado automaticamente."
   else
-    echo "  ATENÇÃO: falhou ou não foi confirmado. Verifique manualmente no servidor principal."
+    echo "  ATENÇÃO: falhou ou não foi confirmado."
+  fi
+
+  echo ""
+  echo "Validação de conexão:"
+  if [ "${REMOTE_TEST_RESULT:-1}" = "0" ]; then
+    echo "  OK: o principal acessa $AGENT_PUBLIC_IP:9001."
+  else
+    echo "  ATENÇÃO: conexão não validada."
   fi
   echo ""
 fi
 
-echo "Containers:"
+echo "Containers locais:"
 docker ps --format "table {{.Names}}\t{{.Image}}\t{{.Status}}\t{{.Ports}}"
 
 echo ""
@@ -737,8 +888,4 @@ echo "  docker compose logs -f portainer-agent"
 echo ""
 echo "Para ver o segredo depois:"
 echo "  cat $AGENT_SECRET_FILE"
-echo ""
-echo "IMPORTANTE:"
-echo "  Se a aplicação automática no Portainer principal falhar,"
-echo "  configure manualmente o mesmo AGENT_SECRET no Portainer Server."
 echo "============================================================"

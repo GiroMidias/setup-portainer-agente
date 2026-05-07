@@ -132,6 +132,68 @@ detect_public_ip() {
   curl -4 -fsSL https://ifconfig.me 2>/dev/null || true
 }
 
+read_local_agent_secret() {
+  local secret_file="$1"
+
+  if [ -f "$secret_file" ]; then
+    awk -F= '/^AGENT_SECRET=/{print $2; exit}' "$secret_file" 2>/dev/null | tr -d '\r' || true
+  fi
+
+  return 0
+}
+
+fetch_main_agent_secret() {
+  local main_server_ip="$1"
+  local main_ssh_user="$2"
+  local main_ssh_port="$3"
+  local main_secret_file="$4"
+
+  ssh -p "$main_ssh_port" \
+    -o ConnectTimeout=10 \
+    -o StrictHostKeyChecking=accept-new \
+    "$main_ssh_user@$main_server_ip" \
+    bash -s -- "$main_secret_file" <<'REMOTE_SECRET'
+set -e
+
+MAIN_SECRET_FILE="$1"
+
+if [ -f "$MAIN_SECRET_FILE" ]; then
+  awk -F= '/^AGENT_SECRET=/{print $2; exit}' "$MAIN_SECRET_FILE" 2>/dev/null | tr -d '\r'
+  exit 0
+fi
+
+if ! command -v docker >/dev/null 2>&1; then
+  exit 0
+fi
+
+SWARM_STATE="$(docker info --format '{{.Swarm.LocalNodeState}}' 2>/dev/null || echo inactive)"
+
+if [ "$SWARM_STATE" = "active" ]; then
+  PORTAINER_SERVICES="$(docker service ls --format '{{.Name}} {{.Image}}' \
+    | grep -E 'portainer/portainer|portainer/portainer-ce|portainer/portainer-ee' \
+    | awk '{print $1}' || true)"
+
+  for service in $PORTAINER_SERVICES; do
+    docker service inspect "$service" \
+      --format '{{range .Spec.TaskTemplate.ContainerSpec.Env}}{{println .}}{{end}}' 2>/dev/null \
+      | awk -F= '/^AGENT_SECRET=/{print $2; exit}'
+  done | awk 'NF{print; exit}'
+
+  exit 0
+fi
+
+PORTAINER_CONTAINERS="$(docker ps --format '{{.ID}} {{.Image}}' \
+  | grep -E 'portainer/portainer|portainer/portainer-ce|portainer/portainer-ee' \
+  | awk '{print $1}' || true)"
+
+for container in $PORTAINER_CONTAINERS; do
+  docker inspect "$container" \
+    --format '{{range .Config.Env}}{{println .}}{{end}}' 2>/dev/null \
+    | awk -F= '/^AGENT_SECRET=/{print $2; exit}'
+done | awk 'NF{print; exit}'
+REMOTE_SECRET
+}
+
 network_has_active_endpoints() {
   local network_name="$1"
 
@@ -292,21 +354,90 @@ if [ "$INSTALL_UFW" = "yes" ]; then
   fi
 fi
 
-GENERATE_SECRET="$(ask_yes_no "Gerar AGENT_SECRET automaticamente?" "S")"
+MAIN_SERVER_IP=""
+MAIN_SSH_USER="root"
+MAIN_SSH_PORT="22"
+CONFIGURE_MAIN="no"
+APPLY_SECRET_TO_MAIN="no"
+APPLY_SECRET_RESULT="1"
+REMOTE_TEST_RESULT="1"
 
-if [ "$GENERATE_SECRET" = "yes" ]; then
-  AGENT_SECRET="$(generate_secret)"
-else
-  echo ""
-  printf "Digite o AGENT_SECRET manualmente: " >&2
-  read -r -s AGENT_SECRET
-  echo ""
+echo ""
+echo "Modo do AGENT_SECRET:"
+echo "  reuse    = recomendado; usa o secret já existente no Portainer principal"
+echo "  generate = gera um novo secret; use só no primeiro bootstrap ou rotação planejada"
+echo "  manual   = você cola o secret atual manualmente"
+echo ""
 
-  if [ -z "$AGENT_SECRET" ]; then
-    echo "ERRO: AGENT_SECRET vazio."
+AGENT_SECRET_MODE="$(ask_default "Modo do AGENT_SECRET" "reuse")"
+
+case "$AGENT_SECRET_MODE" in
+  reuse|REUSE|Reuse)
+    AGENT_SECRET="$(read_local_agent_secret "$AGENT_SECRET_FILE")"
+
+    if [ -n "$AGENT_SECRET" ]; then
+      echo "OK: AGENT_SECRET local encontrado em $AGENT_SECRET_FILE."
+    else
+      echo ""
+      echo "Para não substituir os outros agents, vou buscar o AGENT_SECRET atual no Portainer principal."
+      MAIN_SERVER_IP="$(ask_required "IP do Portainer Server principal: ")"
+      MAIN_SSH_USER="$(ask_default "Usuário SSH do Portainer Server principal" "root")"
+      MAIN_SSH_PORT="$(ask_default "Porta SSH do Portainer Server principal" "22")"
+
+      set +e
+      AGENT_SECRET="$(fetch_main_agent_secret "$MAIN_SERVER_IP" "$MAIN_SSH_USER" "$MAIN_SSH_PORT" "$AGENT_SECRET_FILE")"
+      FETCH_SECRET_RESULT="$?"
+      set -e
+
+      if [ "$FETCH_SECRET_RESULT" != "0" ] || [ -z "$AGENT_SECRET" ]; then
+        echo ""
+        echo "ERRO: não consegui buscar o AGENT_SECRET no Portainer principal."
+        echo "Isso evita sobrescrever o secret do principal e derrubar os outros agents."
+        echo ""
+        echo "Opções seguras:"
+        echo "  1. Rode novamente e escolha modo 'manual' colando o AGENT_SECRET atual"
+        echo "  2. Rode no principal: cat $AGENT_SECRET_FILE"
+        echo "  3. Se for bootstrap inicial, rode novamente e escolha modo 'generate'"
+        exit 1
+      fi
+
+      echo "OK: AGENT_SECRET atual obtido do Portainer principal."
+      CONFIGURE_MAIN="yes"
+    fi
+
+    APPLY_SECRET_TO_MAIN="no"
+    ;;
+  generate|GENERATE|Generate)
+    echo ""
+    echo "ATENÇÃO: gerar um novo AGENT_SECRET pode desconectar agents antigos se o principal for atualizado."
+    CONFIRM_GENERATE="$(ask_yes_no "Confirmar geração de novo AGENT_SECRET?" "N")"
+
+    if [ "$CONFIRM_GENERATE" != "yes" ]; then
+      echo "Geração cancelada para proteger os agents existentes."
+      exit 1
+    fi
+
+    AGENT_SECRET="$(generate_secret)"
+    APPLY_SECRET_TO_MAIN="$(ask_yes_no "Aplicar este novo AGENT_SECRET no Portainer principal?" "N")"
+    ;;
+  manual|MANUAL|Manual)
+    echo ""
+    printf "Digite o AGENT_SECRET atual: " >&2
+    read -r -s AGENT_SECRET
+    echo ""
+
+    if [ -z "$AGENT_SECRET" ]; then
+      echo "ERRO: AGENT_SECRET vazio."
+      exit 1
+    fi
+
+    APPLY_SECRET_TO_MAIN="$(ask_yes_no "Aplicar/rotacionar este AGENT_SECRET no Portainer principal?" "N")"
+    ;;
+  *)
+    echo "ERRO: modo inválido. Use reuse, generate ou manual."
     exit 1
-  fi
-fi
+    ;;
+esac
 
 echo ""
 echo "Resumo da instalação local:"
@@ -336,7 +467,8 @@ else
 fi
 
 echo "Volumes externos:        não serão criados automaticamente"
-echo "AGENT_SECRET:            gerado/definido e será salvo com permissão 600"
+echo "AGENT_SECRET:            modo $AGENT_SECRET_MODE; será salvo com permissão 600"
+echo "Aplicar no principal:    $APPLY_SECRET_TO_MAIN"
 echo "------------------------------------------------------------"
 echo ""
 
@@ -698,22 +830,27 @@ echo "============================================================"
 echo ""
 echo "Agora informe os dados de acesso SSH ao servidor principal."
 echo "O script vai entrar nele, detectar Portainer via Swarm ou Compose,"
-echo "aplicar o AGENT_SECRET no Portainer Server e nos Agents existentes,"
-echo "e depois validar conexão com este Agent."
+echo "validar conexão com este Agent e, se você autorizou rotação,"
+echo "aplicar o AGENT_SECRET no Portainer Server e nos Agents locais do principal."
 echo ""
 
-CONFIGURE_MAIN="$(ask_yes_no "Configurar automaticamente o Portainer principal agora?" "S")"
+if [ -n "$MAIN_SERVER_IP" ]; then
+  CONFIGURE_MAIN_DEFAULT="S"
+else
+  CONFIGURE_MAIN_DEFAULT="S"
+fi
 
-MAIN_SERVER_IP=""
-MAIN_SSH_USER="root"
-MAIN_SSH_PORT="22"
-APPLY_SECRET_RESULT="1"
-REMOTE_TEST_RESULT="1"
+CONFIGURE_MAIN="$(ask_yes_no "Configurar/validar automaticamente o Portainer principal agora?" "$CONFIGURE_MAIN_DEFAULT")"
 
 if [ "$CONFIGURE_MAIN" = "yes" ]; then
-  MAIN_SERVER_IP="$(ask_required "IP do Portainer Server principal: ")"
-  MAIN_SSH_USER="$(ask_default "Usuário SSH do Portainer Server principal" "root")"
-  MAIN_SSH_PORT="$(ask_default "Porta SSH do Portainer Server principal" "22")"
+  if [ -z "$MAIN_SERVER_IP" ]; then
+    MAIN_SERVER_IP="$(ask_required "IP do Portainer Server principal: ")"
+  else
+    MAIN_SERVER_IP="$(ask_default "IP do Portainer Server principal" "$MAIN_SERVER_IP")"
+  fi
+
+  MAIN_SSH_USER="$(ask_default "Usuário SSH do Portainer Server principal" "$MAIN_SSH_USER")"
+  MAIN_SSH_PORT="$(ask_default "Porta SSH do Portainer Server principal" "$MAIN_SSH_PORT")"
 
   echo ""
   echo "Resumo da configuração do servidor principal:"
@@ -722,7 +859,7 @@ if [ "$CONFIGURE_MAIN" = "yes" ]; then
   echo "SSH principal:           $MAIN_SSH_USER@$MAIN_SERVER_IP:$MAIN_SSH_PORT"
   echo "Servidor Agent:          $AGENT_PUBLIC_IP:9001"
   echo "Detecção Portainer:      automática"
-  echo "Aplicar secret em:       Portainer Server + Agents existentes"
+  echo "Aplicar secret em:       $APPLY_SECRET_TO_MAIN"
   echo "------------------------------------------------------------"
   echo ""
 
@@ -756,13 +893,16 @@ if [ "$CONFIGURE_MAIN" = "yes" ]; then
     echo "============================================================"
     echo ""
 
-    set +e
+    if [ "$APPLY_SECRET_TO_MAIN" = "yes" ]; then
+      echo "Rotação autorizada: o AGENT_SECRET será aplicado no Portainer principal."
 
-    ssh -p "$MAIN_SSH_PORT" \
-      -o ConnectTimeout=10 \
-      -o StrictHostKeyChecking=accept-new \
-      "$MAIN_SSH_USER@$MAIN_SERVER_IP" \
-      bash -s -- "$AGENT_SECRET" <<'REMOTE_SCRIPT'
+      set +e
+
+      ssh -p "$MAIN_SSH_PORT" \
+        -o ConnectTimeout=10 \
+        -o StrictHostKeyChecking=accept-new \
+        "$MAIN_SSH_USER@$MAIN_SERVER_IP" \
+        bash -s -- "$AGENT_SECRET" <<'REMOTE_SCRIPT'
 set -e
 
 AGENT_SECRET="$1"
@@ -979,20 +1119,26 @@ echo ""
 echo "OK: AGENT_SECRET aplicado nos serviços Compose: $COMPOSE_SERVICES"
 REMOTE_SCRIPT
 
-    APPLY_SECRET_RESULT="$?"
+      APPLY_SECRET_RESULT="$?"
 
-    set -e
+      set -e
 
-    if [ "$APPLY_SECRET_RESULT" = "0" ]; then
-      echo ""
-      echo "OK: AGENT_SECRET aplicado automaticamente no Portainer Server principal e Agents."
+      if [ "$APPLY_SECRET_RESULT" = "0" ]; then
+        echo ""
+        echo "OK: AGENT_SECRET aplicado automaticamente no Portainer Server principal e Agents locais."
+      else
+        echo ""
+        echo "ERRO: não foi possível aplicar automaticamente o AGENT_SECRET no Portainer Server principal."
+        echo ""
+        echo "O instalador continuará para os testes, mas talvez você precise verificar manualmente:"
+        echo ""
+        echo "  AGENT_SECRET=$AGENT_SECRET"
+      fi
     else
       echo ""
-      echo "ERRO: não foi possível aplicar automaticamente o AGENT_SECRET no Portainer Server principal."
-      echo ""
-      echo "O instalador continuará para os testes, mas talvez você precise verificar manualmente:"
-      echo ""
-      echo "  AGENT_SECRET=$AGENT_SECRET"
+      echo "Rotação não autorizada: mantendo o AGENT_SECRET atual do Portainer principal."
+      echo "Isso é o comportamento correto para novas instalações."
+      APPLY_SECRET_RESULT="0"
     fi
 
     echo ""

@@ -131,9 +131,72 @@ fi
 REMOTE
 }
 
+get_local_secret() {
+  local secret=""
+
+  from_service() {
+    docker service inspect "$1" --format '{{range .Spec.TaskTemplate.ContainerSpec.Env}}{{println .}}{{end}}' 2>/dev/null \
+      | awk -F= '/^AGENT_SECRET=/{print $2; exit}'
+  }
+
+  from_container() {
+    docker inspect "$1" --format '{{range .Config.Env}}{{println .}}{{end}}' 2>/dev/null \
+      | awk -F= '/^AGENT_SECRET=/{print $2; exit}'
+  }
+
+  find_secret_in_items() {
+    local reader="$1"
+    local item=""
+
+    while read -r item; do
+      [ -n "$item" ] || continue
+      secret="$("$reader" "$item" || true)"
+      if [ -n "$secret" ]; then
+        echo "$secret"
+        return 0
+      fi
+    done
+
+    return 1
+  }
+
+  swarm_state="$(docker info --format '{{.Swarm.LocalNodeState}}' 2>/dev/null || echo inactive)"
+
+  if [ "$swarm_state" = "active" ]; then
+    docker service ls --format '{{.Name}} {{.Image}}' 2>/dev/null \
+      | grep -E 'portainer/portainer|portainer/portainer-ce|portainer/portainer-ee' \
+      | awk '{print $1}' \
+      | find_secret_in_items from_service && return 0
+
+    docker service ls --format '{{.Name}} {{.Image}}' 2>/dev/null \
+      | grep -E 'portainer/agent' \
+      | awk '{print $1}' \
+      | find_secret_in_items from_service && return 0
+  fi
+
+  docker ps --format '{{.ID}} {{.Image}}' 2>/dev/null \
+    | grep -E 'portainer/portainer|portainer/portainer-ce|portainer/portainer-ee' \
+    | awk '{print $1}' \
+    | find_secret_in_items from_container && return 0
+
+  docker ps --format '{{.ID}} {{.Image}}' 2>/dev/null \
+    | grep -E 'portainer/agent' \
+    | awk '{print $1}' \
+    | find_secret_in_items from_container && return 0
+
+  if [ -f "$AGENT_SECRET_FILE" ]; then
+    awk -F= '/^AGENT_SECRET=/{print $2; exit}' "$AGENT_SECRET_FILE" 2>/dev/null | tr -d '\r'
+  fi
+}
+
 if [ -z "$AGENT_SECRET" ] && [ -n "$FETCH_FROM" ]; then
   echo "Buscando AGENT_SECRET no Portainer principal: $FETCH_FROM"
   AGENT_SECRET="$(fetch_secret_from_main "$FETCH_FROM" | tr -d '\r' | head -n 1 || true)"
+fi
+
+if [ -z "$AGENT_SECRET" ]; then
+  echo "Tentando detectar AGENT_SECRET neste servidor..."
+  AGENT_SECRET="$(get_local_secret | tr -d '\r' | head -n 1 || true)"
 fi
 
 if [ -z "$AGENT_SECRET" ]; then

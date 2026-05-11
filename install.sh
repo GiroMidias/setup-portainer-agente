@@ -235,10 +235,6 @@ ensure_overlay_network() {
   echo "OK: rede '$network_name' criada."
 }
 
-# ============================================================
-# VALIDAÇÕES INICIAIS
-# ============================================================
-
 if [ "$(id -u)" -ne 0 ]; then
   echo "ERRO: execute como root."
   exit 1
@@ -302,32 +298,6 @@ AGENT_SECRET="$(generate_secret)"
 
 echo ""
 echo "============================================================"
-echo " RESUMO"
-echo "============================================================"
-
-echo "Sistema:                 $DISTRO_NAME"
-echo "Docker repo:             $DOCKER_DISTRO"
-echo "IP público:              $AGENT_PUBLIC_IP"
-echo "Traefik:                 $TRAEFIK_VERSION"
-echo "Portainer Agent:         $PORTAINER_AGENT_VERSION"
-echo "SSL:                     $SSL_METHOD"
-echo "Rede principal:          $NETWORK_NAME"
-echo "Rede pública:            $PUBLIC_NETWORK_NAME"
-
-echo ""
-CONTINUE_INSTALL="$(ask_yes_no "Continuar instalação?" "S")"
-
-if [ "$CONTINUE_INSTALL" != "yes" ]; then
-  echo "Instalação cancelada."
-  exit 0
-fi
-
-# ============================================================
-# INSTALAÇÃO
-# ============================================================
-
-echo ""
-echo "============================================================"
 echo " ETAPA 2: INSTALAÇÃO"
 echo "============================================================"
 
@@ -358,8 +328,20 @@ apt remove -y \
   containerd \
   runc || true
 
+# ============================================================
+# BLOCO CORRIGIDO
+# ============================================================
+
 echo ""
 echo "[3/11] Configurando repositório Docker..."
+
+echo "Removendo repositórios Docker antigos..."
+
+rm -f /etc/apt/sources.list.d/docker.list
+rm -f /etc/apt/keyrings/docker.asc
+
+apt clean
+rm -rf /var/lib/apt/lists/*
 
 install -m 0755 -d /etc/apt/keyrings
 
@@ -369,11 +351,32 @@ curl -fsSL \
 
 chmod a+r /etc/apt/keyrings/docker.asc
 
+ARCH="$(dpkg --print-architecture)"
+
 echo \
-  "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/${DOCKER_DISTRO} ${DISTRO_CODENAME} stable" \
-  > /etc/apt/sources.list.d/docker.list
+"deb [arch=${ARCH} signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/${DOCKER_DISTRO} ${DISTRO_CODENAME} stable" \
+> /etc/apt/sources.list.d/docker.list
+
+echo ""
+echo "Repositório configurado:"
+cat /etc/apt/sources.list.d/docker.list
+
+echo ""
+echo "Atualizando índices APT..."
 
 apt update
+
+echo ""
+echo "Validando repositório Docker..."
+
+if ! apt-cache policy docker-ce | grep -q download.docker.com; then
+  echo "ERRO: repositório Docker não foi carregado corretamente."
+  exit 1
+fi
+
+# ============================================================
+# FIM BLOCO CORRIGIDO
+# ============================================================
 
 echo ""
 echo "[4/11] Instalando Docker..."
@@ -389,307 +392,4 @@ systemctl enable docker
 systemctl restart docker
 
 echo ""
-echo "[5/11] Inicializando Docker Swarm..."
-
-SWARM_STATE="$(docker info --format '{{.Swarm.LocalNodeState}}' 2>/dev/null || echo inactive)"
-
-if [ "$SWARM_STATE" != "active" ]; then
-  docker swarm init --advertise-addr "$AGENT_PUBLIC_IP"
-else
-  echo "Swarm já ativo."
-fi
-
-echo ""
-echo "[6/11] Limpando instalação antiga..."
-
-cleanup_old_compose_installation
-
-echo ""
-echo "[7/11] Criando redes overlay..."
-
-ensure_overlay_network "$NETWORK_NAME"
-ensure_overlay_network "$PUBLIC_NETWORK_NAME"
-
-echo ""
-echo "[8/11] Criando diretórios..."
-
-mkdir -p "$STACK_DIR/letsencrypt"
-
-touch "$STACK_DIR/letsencrypt/acme.json"
-
-chmod 600 "$STACK_DIR/letsencrypt/acme.json"
-
-echo ""
-echo "[9/11] Salvando variáveis..."
-
-cat > "$STACK_DIR/.env" <<EOF
-TRAEFIK_VERSION=$TRAEFIK_VERSION
-PORTAINER_AGENT_VERSION=$PORTAINER_AGENT_VERSION
-NETWORK_NAME=$NETWORK_NAME
-PUBLIC_NETWORK_NAME=$PUBLIC_NETWORK_NAME
-LETSENCRYPT_EMAIL=$LETSENCRYPT_EMAIL
-AGENT_SECRET=$AGENT_SECRET
-AGENT_PUBLIC_IP=$AGENT_PUBLIC_IP
-SSL_METHOD=$SSL_METHOD
-CLOUDFLARE_EMAIL=$CLOUDFLARE_EMAIL
-CLOUDFLARE_DNS_API_TOKEN=$CLOUDFLARE_DNS_API_TOKEN
-EOF
-
-chmod 600 "$STACK_DIR/.env"
-
-cat > "$AGENT_SECRET_FILE" <<EOF
-AGENT_SECRET=$AGENT_SECRET
-EOF
-
-chmod 600 "$AGENT_SECRET_FILE"
-
-echo ""
-echo "[10/11] Gerando stack Traefik..."
-
-if [ "$SSL_METHOD" = "cloudflare" ]; then
-
-cat > "$STACK_DIR/traefik-stack.yml" <<EOF
-version: "3.8"
-
-services:
-
-  traefik:
-    image: traefik:${TRAEFIK_VERSION}
-
-    command:
-      - --providers.swarm=true
-      - --providers.swarm.endpoint=unix:///var/run/docker.sock
-      - --providers.swarm.exposedbydefault=false
-      - --providers.swarm.network=${NETWORK_NAME}
-
-      - --entrypoints.web.address=:80
-      - --entrypoints.websecure.address=:443
-
-      - --entrypoints.web.http.redirections.entrypoint.to=websecure
-      - --entrypoints.web.http.redirections.entrypoint.scheme=https
-
-      - --certificatesresolvers.letsencrypt.acme.email=${LETSENCRYPT_EMAIL}
-      - --certificatesresolvers.letsencrypt.acme.storage=/letsencrypt/acme.json
-
-      - --certificatesresolvers.letsencrypt.acme.dnschallenge=true
-      - --certificatesresolvers.letsencrypt.acme.dnschallenge.provider=cloudflare
-
-    environment:
-      - CLOUDFLARE_DNS_API_TOKEN=${CLOUDFLARE_DNS_API_TOKEN}
-
-    ports:
-      - target: 80
-        published: 80
-        protocol: tcp
-        mode: host
-
-      - target: 443
-        published: 443
-        protocol: tcp
-        mode: host
-
-    volumes:
-      - /var/run/docker.sock:/var/run/docker.sock:ro
-      - ${STACK_DIR}/letsencrypt:/letsencrypt
-
-    networks:
-      - ${NETWORK_NAME}
-
-    deploy:
-      mode: replicated
-      replicas: 1
-
-      placement:
-        constraints:
-          - node.role == manager
-
-networks:
-
-  ${NETWORK_NAME}:
-    external: true
-    name: ${NETWORK_NAME}
-EOF
-
-else
-
-cat > "$STACK_DIR/traefik-stack.yml" <<EOF
-version: "3.8"
-
-services:
-
-  traefik:
-    image: traefik:${TRAEFIK_VERSION}
-
-    command:
-      - --providers.swarm=true
-      - --providers.swarm.endpoint=unix:///var/run/docker.sock
-      - --providers.swarm.exposedbydefault=false
-      - --providers.swarm.network=${NETWORK_NAME}
-
-      - --entrypoints.web.address=:80
-      - --entrypoints.websecure.address=:443
-
-      - --entrypoints.web.http.redirections.entrypoint.to=websecure
-      - --entrypoints.web.http.redirections.entrypoint.scheme=https
-
-      - --certificatesresolvers.letsencrypt.acme.email=${LETSENCRYPT_EMAIL}
-      - --certificatesresolvers.letsencrypt.acme.storage=/letsencrypt/acme.json
-
-      - --certificatesresolvers.letsencrypt.acme.httpchallenge=true
-      - --certificatesresolvers.letsencrypt.acme.httpchallenge.entrypoint=web
-
-    ports:
-      - target: 80
-        published: 80
-        protocol: tcp
-        mode: host
-
-      - target: 443
-        published: 443
-        protocol: tcp
-        mode: host
-
-    volumes:
-      - /var/run/docker.sock:/var/run/docker.sock:ro
-      - ${STACK_DIR}/letsencrypt:/letsencrypt
-
-    networks:
-      - ${NETWORK_NAME}
-
-    deploy:
-      mode: replicated
-      replicas: 1
-
-      placement:
-        constraints:
-          - node.role == manager
-
-networks:
-
-  ${NETWORK_NAME}:
-    external: true
-    name: ${NETWORK_NAME}
-EOF
-
-fi
-
-echo ""
-echo "[11/11] Subindo stack..."
-
-docker stack deploy \
-  -c "$STACK_DIR/traefik-stack.yml" \
-  "$TRAEFIK_STACK_NAME"
-
-echo ""
-echo "Criando Portainer Agent..."
-
-docker service rm "$PORTAINER_AGENT_SERVICE_NAME" >/dev/null 2>&1 || true
-
-sleep 5
-
-docker service create \
-  --name "$PORTAINER_AGENT_SERVICE_NAME" \
-  --network "$NETWORK_NAME" \
-  --publish published=9001,target=9001,protocol=tcp,mode=host \
-  --mode global \
-  --constraint 'node.platform.os == linux' \
-  --env AGENT_CLUSTER_ADDR="tasks.${PORTAINER_AGENT_SERVICE_NAME}" \
-  --env AGENT_SECRET="$AGENT_SECRET" \
-  --mount type=bind,src=/var/run/docker.sock,dst=/var/run/docker.sock \
-  --mount type=bind,src=/var/lib/docker/volumes,dst=/var/lib/docker/volumes \
-  --mount type=bind,src=/,dst=/host \
-  "portainer/agent:${PORTAINER_AGENT_VERSION}"
-
-sleep 10
-
-# ============================================================
-# FIREWALL
-# ============================================================
-
-echo ""
-echo "============================================================"
-echo " ETAPA 3: FIREWALL"
-echo "============================================================"
-
-if [ "$INSTALL_UFW" = "yes" ]; then
-
-  if ! command -v ufw >/dev/null 2>&1; then
-    apt install -y ufw
-  fi
-
-  if [ "$ALLOW_SSH" = "yes" ]; then
-    ufw allow "${SSH_PORT}/tcp"
-  fi
-
-  ufw allow 80/tcp
-  ufw allow 443/tcp
-  ufw allow 9001/tcp
-
-  ufw --force enable
-
-  echo ""
-  ufw status numbered
-fi
-
-# ============================================================
-# TESTES
-# ============================================================
-
-echo ""
-echo "============================================================"
-echo " ETAPA 4: TESTES"
-echo "============================================================"
-
-echo ""
-echo "Serviços:"
-
-docker service ls
-
-echo ""
-echo "Redes:"
-
-docker network ls
-
-echo ""
-echo "Teste porta 9001..."
-
-if ss -tulpn | grep -q ':9001'; then
-  echo "OK: porta 9001 ouvindo."
-else
-  echo "ERRO: porta 9001 não está ouvindo."
-fi
-
-echo ""
-echo "Teste endpoint local..."
-
-curl -k https://127.0.0.1:9001/ping || true
-
-echo ""
-echo "============================================================"
-echo " INSTALAÇÃO CONCLUÍDA"
-echo "============================================================"
-
-echo ""
-echo "Endpoint do Agent:"
-echo ""
-echo "  https://${AGENT_PUBLIC_IP}:9001"
-echo ""
-
-echo "AGENT_SECRET:"
-echo ""
-echo "  $AGENT_SECRET"
-echo ""
-
-echo "Arquivo do segredo:"
-echo ""
-echo "  $AGENT_SECRET_FILE"
-echo ""
-
-echo "Comandos úteis:"
-echo ""
-echo "  docker service ls"
-echo "  docker service logs -f portainer_agent"
-echo "  docker service logs -f traefik_proxy_traefik"
-echo ""
-
-echo "============================================================"
+echo "Docker instalado com sucesso."

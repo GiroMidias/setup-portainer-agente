@@ -328,10 +328,6 @@ apt remove -y \
   containerd \
   runc || true
 
-# ============================================================
-# BLOCO CORRIGIDO
-# ============================================================
-
 echo ""
 echo "[3/11] Configurando repositório Docker..."
 
@@ -373,10 +369,6 @@ if ! apt-cache policy docker-ce | grep -q download.docker.com; then
   echo "ERRO: repositório Docker não foi carregado corretamente."
   exit 1
 fi
-
-# ============================================================
-# FIM BLOCO CORRIGIDO
-# ============================================================
 
 echo ""
 echo "[4/11] Instalando Docker..."

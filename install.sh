@@ -365,8 +365,17 @@ apt update
 echo ""
 echo "Validando repositório Docker..."
 
-if ! apt-cache madison docker-ce | grep -q download.docker.com; then
-  echo "ERRO: repositório Docker não foi carregado corretamente."
+if ! grep -q "download.docker.com" /etc/apt/sources.list.d/docker.list; then
+  echo "ERRO: repositório Docker não configurado."
+  exit 1
+fi
+
+if ! apt-cache policy docker-ce | grep -q "download.docker.com"; then
+  echo ""
+  echo "Repositório encontrado:"
+  cat /etc/apt/sources.list.d/docker.list
+  echo ""
+  echo "ERRO: Docker repo não apareceu no apt-cache."
   exit 1
 fi
 

@@ -35,6 +35,7 @@ DEFAULT_LETSENCRYPT_EMAIL="admin@example.com"
 DEFAULT_SSH_PORT="22"
 
 AGENT_SECRET_FILE="/root/portainer-agent-secret.txt"
+CONFIG_FILE="/root/install-traefik-portainer-agent.conf"
 
 # ============================================================
 # DETECÇÃO DO SISTEMA OPERACIONAL
@@ -94,6 +95,10 @@ detect_os() {
   echo "------------------------------------------------------------"
   echo ""
 }
+
+# ============================================================
+# INPUTS
+# ============================================================
 
 ask_required() {
   local prompt="$1"
@@ -179,6 +184,10 @@ ask_ssl_method() {
   done
 }
 
+# ============================================================
+# HELPERS
+# ============================================================
+
 generate_secret() {
   openssl rand -hex 32
 }
@@ -187,25 +196,68 @@ detect_public_ip() {
   curl -4 -fsSL https://ifconfig.me 2>/dev/null || true
 }
 
-cleanup_old_compose_installation() {
-  echo ""
-  echo "[Limpeza] Verificando instalação antiga via Docker Compose..."
+# ============================================================
+# PERSISTÊNCIA DE CONFIGURAÇÃO
+# ============================================================
 
-  if [ -f "$STACK_DIR/docker-compose.yml" ]; then
-    echo "Encontrado docker-compose.yml antigo em $STACK_DIR."
-    echo "Derrubando stack antiga..."
-    cd "$STACK_DIR"
-    docker compose down || true
-  fi
+load_previous_config() {
+  if [ -f "$CONFIG_FILE" ]; then
+    echo ""
+    echo "============================================================"
+    echo " CONFIGURAÇÃO ANTERIOR ENCONTRADA"
+    echo "============================================================"
 
-  if docker ps -a --format '{{.Names}}' | grep -q '^traefik$'; then
-    docker rm -f traefik || true
-  fi
+    source "$CONFIG_FILE"
 
-  if docker ps -a --format '{{.Names}}' | grep -q '^portainer_agent$'; then
-    docker rm -f portainer_agent || true
+    echo "Arquivo carregado:"
+    echo "$CONFIG_FILE"
+    echo ""
+
+    USE_PREVIOUS="$(ask_yes_no "Usar respostas salvas da última instalação?" "S")"
+
+    if [ "$USE_PREVIOUS" != "yes" ]; then
+      rm -f "$CONFIG_FILE"
+
+      unset AGENT_PUBLIC_IP
+      unset LETSENCRYPT_EMAIL
+      unset TRAEFIK_VERSION
+      unset PORTAINER_AGENT_VERSION
+      unset SSL_METHOD
+      unset CLOUDFLARE_EMAIL
+      unset CLOUDFLARE_DNS_API_TOKEN
+      unset INSTALL_UFW
+      unset ALLOW_SSH
+      unset SSH_PORT
+
+      echo "Configuração anterior removida."
+    fi
   fi
 }
+
+save_config() {
+  cat > "$CONFIG_FILE" <<EOF
+AGENT_PUBLIC_IP="${AGENT_PUBLIC_IP}"
+LETSENCRYPT_EMAIL="${LETSENCRYPT_EMAIL}"
+TRAEFIK_VERSION="${TRAEFIK_VERSION}"
+PORTAINER_AGENT_VERSION="${PORTAINER_AGENT_VERSION}"
+SSL_METHOD="${SSL_METHOD}"
+CLOUDFLARE_EMAIL="${CLOUDFLARE_EMAIL}"
+CLOUDFLARE_DNS_API_TOKEN="${CLOUDFLARE_DNS_API_TOKEN}"
+INSTALL_UFW="${INSTALL_UFW}"
+ALLOW_SSH="${ALLOW_SSH}"
+SSH_PORT="${SSH_PORT}"
+EOF
+
+  chmod 600 "$CONFIG_FILE"
+
+  echo ""
+  echo "Configuração salva em:"
+  echo "$CONFIG_FILE"
+}
+
+# ============================================================
+# NETWORKS
+# ============================================================
 
 ensure_overlay_network() {
   local network_name="$1"
@@ -235,64 +287,118 @@ ensure_overlay_network() {
   echo "OK: rede '$network_name' criada."
 }
 
+# ============================================================
+# ROOT CHECK
+# ============================================================
+
 if [ "$(id -u)" -ne 0 ]; then
   echo "ERRO: execute como root."
   exit 1
 fi
 
+# ============================================================
+# DETECT OS
+# ============================================================
+
 detect_os
+
+# ============================================================
+# LOAD CONFIG
+# ============================================================
+
+load_previous_config
+
+# ============================================================
+# ETAPA 1
+# ============================================================
 
 echo "============================================================"
 echo " ETAPA 1: DADOS DA INSTALAÇÃO LOCAL"
 echo "============================================================"
 
-AGENT_PUBLIC_IP_DEFAULT="$(detect_public_ip)"
+AGENT_PUBLIC_IP_DEFAULT="${AGENT_PUBLIC_IP:-$(detect_public_ip)}"
 
 if [ -z "$AGENT_PUBLIC_IP_DEFAULT" ]; then
   AGENT_PUBLIC_IP_DEFAULT="IP_DESTE_SERVIDOR"
 fi
 
-AGENT_PUBLIC_IP="$(ask_default "IP público deste servidor Agent" "$AGENT_PUBLIC_IP_DEFAULT")"
+AGENT_PUBLIC_IP="$(ask_default \
+  "IP público deste servidor Agent" \
+  "$AGENT_PUBLIC_IP_DEFAULT")"
 
-LETSENCRYPT_EMAIL="$(ask_default "E-mail para Let's Encrypt" "$DEFAULT_LETSENCRYPT_EMAIL")"
+LETSENCRYPT_EMAIL="$(ask_default \
+  "E-mail para Let's Encrypt" \
+  "${LETSENCRYPT_EMAIL:-$DEFAULT_LETSENCRYPT_EMAIL}")"
 
-TRAEFIK_VERSION="$(ask_default "Versão do Traefik" "$DEFAULT_TRAEFIK_VERSION")"
+TRAEFIK_VERSION="$(ask_default \
+  "Versão do Traefik" \
+  "${TRAEFIK_VERSION:-$DEFAULT_TRAEFIK_VERSION}")"
 
-PORTAINER_AGENT_VERSION="$(ask_default "Versão do Portainer Agent" "$DEFAULT_PORTAINER_AGENT_VERSION")"
+PORTAINER_AGENT_VERSION="$(ask_default \
+  "Versão do Portainer Agent" \
+  "${PORTAINER_AGENT_VERSION:-$DEFAULT_PORTAINER_AGENT_VERSION}")"
 
-SSL_METHOD="$(ask_ssl_method)"
+if [ -n "${SSL_METHOD:-}" ]; then
+  SSL_METHOD="$(ask_default \
+    "Método SSL (http/cloudflare)" \
+    "$SSL_METHOD")"
+else
+  SSL_METHOD="$(ask_ssl_method)"
+fi
 
-CLOUDFLARE_EMAIL=""
-CLOUDFLARE_DNS_API_TOKEN=""
+CLOUDFLARE_EMAIL="${CLOUDFLARE_EMAIL:-}"
+CLOUDFLARE_DNS_API_TOKEN="${CLOUDFLARE_DNS_API_TOKEN:-}"
 
 if [ "$SSL_METHOD" = "cloudflare" ]; then
   echo ""
   echo "Configuração Cloudflare"
 
-  CLOUDFLARE_EMAIL="$(ask_required "E-mail Cloudflare: ")"
+  CLOUDFLARE_EMAIL="$(ask_default \
+    "E-mail Cloudflare" \
+    "$CLOUDFLARE_EMAIL")"
 
-  printf "Cloudflare API Token: " >&2
-  read -r -s CLOUDFLARE_DNS_API_TOKEN
-  echo ""
+  if [ -n "$CLOUDFLARE_DNS_API_TOKEN" ]; then
+    USE_SAVED_CF_TOKEN="$(ask_yes_no \
+      "Usar token Cloudflare salvo?" \
+      "S")"
+
+    if [ "$USE_SAVED_CF_TOKEN" != "yes" ]; then
+      CLOUDFLARE_DNS_API_TOKEN=""
+    fi
+  fi
 
   if [ -z "$CLOUDFLARE_DNS_API_TOKEN" ]; then
-    echo "ERRO: token vazio."
-    exit 1
+    printf "Cloudflare API Token: " >&2
+    read -r -s CLOUDFLARE_DNS_API_TOKEN
+    echo ""
+
+    if [ -z "$CLOUDFLARE_DNS_API_TOKEN" ]; then
+      echo "ERRO: token vazio."
+      exit 1
+    fi
   fi
 fi
 
-INSTALL_UFW="$(ask_yes_no "Instalar/configurar UFW?" "S")"
+INSTALL_UFW="$(ask_default \
+  "Instalar/configurar UFW? (yes/no)" \
+  "${INSTALL_UFW:-yes}")"
 
-ALLOW_SSH="yes"
-SSH_PORT="$DEFAULT_SSH_PORT"
+ALLOW_SSH="${ALLOW_SSH:-yes}"
+SSH_PORT="${SSH_PORT:-$DEFAULT_SSH_PORT}"
 
 if [ "$INSTALL_UFW" = "yes" ]; then
-  ALLOW_SSH="$(ask_yes_no "Liberar SSH?" "S")"
+  ALLOW_SSH="$(ask_default \
+    "Liberar SSH? (yes/no)" \
+    "$ALLOW_SSH")"
 
   if [ "$ALLOW_SSH" = "yes" ]; then
-    SSH_PORT="$(ask_default "Porta SSH" "$DEFAULT_SSH_PORT")"
+    SSH_PORT="$(ask_default \
+      "Porta SSH" \
+      "$SSH_PORT")"
   fi
 fi
+
+save_config
 
 AGENT_SECRET="$(generate_secret)"
 
@@ -331,8 +437,6 @@ apt remove -y \
 echo ""
 echo "[3/11] Configurando repositório Docker..."
 
-echo "Removendo repositórios Docker antigos..."
-
 rm -f /etc/apt/sources.list.d/docker.list
 rm -f /etc/apt/keyrings/docker.asc
 
@@ -354,10 +458,6 @@ echo \
 > /etc/apt/sources.list.d/docker.list
 
 echo ""
-echo "Repositório configurado:"
-cat /etc/apt/sources.list.d/docker.list
-
-echo ""
 echo "Atualizando índices APT..."
 
 apt update
@@ -371,10 +471,6 @@ if ! grep -q "download.docker.com" /etc/apt/sources.list.d/docker.list; then
 fi
 
 if ! apt-cache policy docker-ce | grep -q "download.docker.com"; then
-  echo ""
-  echo "Repositório encontrado:"
-  cat /etc/apt/sources.list.d/docker.list
-  echo ""
   echo "ERRO: Docker repo não apareceu no apt-cache."
   exit 1
 fi

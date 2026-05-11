@@ -365,10 +365,12 @@ apt update
 echo ""
 echo "Validando repositório Docker..."
 
-if ! apt-cache policy docker-ce | grep -q download.docker.com; then
+if ! apt-cache madison docker-ce | grep -q download.docker.com; then
   echo "ERRO: repositório Docker não foi carregado corretamente."
   exit 1
 fi
+
+echo "OK: repositório Docker validado."
 
 echo ""
 echo "[4/11] Instalando Docker..."

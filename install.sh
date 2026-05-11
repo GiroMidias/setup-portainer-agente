@@ -37,6 +37,9 @@ DEFAULT_SSH_PORT="22"
 AGENT_SECRET_FILE="/root/portainer-agent-secret.txt"
 CONFIG_FILE="/root/install-traefik-portainer-agent.conf"
 
+CONFIG_LOADED="no"
+FORCE_RECONFIG="${FORCE_RECONFIG:-0}"
+
 # ============================================================
 # DETECÇÃO DO SISTEMA OPERACIONAL
 # ============================================================
@@ -52,18 +55,20 @@ detect_os() {
     exit 1
   fi
 
+  # shellcheck disable=SC1091
   source /etc/os-release
 
   DISTRO_ID="${ID,,}"
-  DISTRO_CODENAME="${VERSION_CODENAME:-}"
   DISTRO_NAME="${PRETTY_NAME:-$ID}"
 
   case "$DISTRO_ID" in
     debian)
       DOCKER_DISTRO="debian"
+      DISTRO_CODENAME="${VERSION_CODENAME:-}"
       ;;
     ubuntu)
       DOCKER_DISTRO="ubuntu"
+      DISTRO_CODENAME="${UBUNTU_CODENAME:-${VERSION_CODENAME:-}}"
       ;;
     *)
       echo "ERRO: sistema operacional não suportado."
@@ -125,6 +130,35 @@ ask_default() {
   read -r value
 
   echo "${value:-$default_value}"
+}
+
+ask_saved_or_default() {
+  local var_name="$1"
+  local prompt="$2"
+  local default_value="$3"
+  local saved_value="${!var_name:-}"
+
+  if [ "$CONFIG_LOADED" = "yes" ] && [ "$FORCE_RECONFIG" != "1" ] && [ -n "$saved_value" ]; then
+    echo "Usando valor salvo: $prompt" >&2
+    echo "$saved_value"
+    return
+  fi
+
+  ask_default "$prompt" "$default_value"
+}
+
+ask_saved_or_required() {
+  local var_name="$1"
+  local prompt="$2"
+  local saved_value="${!var_name:-}"
+
+  if [ "$CONFIG_LOADED" = "yes" ] && [ "$FORCE_RECONFIG" != "1" ] && [ -n "$saved_value" ]; then
+    echo "Usando valor salvo: $prompt" >&2
+    echo "$saved_value"
+    return
+  fi
+
+  ask_required "$prompt"
 }
 
 ask_yes_no() {
@@ -196,6 +230,50 @@ detect_public_ip() {
   curl -4 -fsSL https://ifconfig.me 2>/dev/null || true
 }
 
+run_apt_update() {
+  local attempt=1
+  local max_attempts=3
+
+  while [ "$attempt" -le "$max_attempts" ]; do
+    if apt-get update; then
+      return 0
+    fi
+
+    echo ""
+    echo "AVISO: apt-get update falhou. Tentativa $attempt de $max_attempts."
+    echo "Tentando novamente em 3 segundos..."
+    sleep 3
+
+    attempt=$((attempt + 1))
+  done
+
+  echo "ERRO: apt-get update falhou após $max_attempts tentativas."
+  exit 1
+}
+
+normalize_yes_no_value() {
+  local value="$1"
+
+  case "$value" in
+    S|s|Y|y|sim|SIM|Sim|yes|YES|Yes)
+      echo "yes"
+      ;;
+    N|n|nao|NAO|Nao|não|NÃO|Não|no|NO|No)
+      echo "no"
+      ;;
+    *)
+      echo "$value"
+      ;;
+  esac
+}
+
+write_config_value() {
+  local key="$1"
+  local value="$2"
+
+  printf "%s=%q\n" "$key" "$value" >> "$CONFIG_FILE"
+}
+
 # ============================================================
 # PERSISTÊNCIA DE CONFIGURAÇÃO
 # ============================================================
@@ -207,52 +285,128 @@ load_previous_config() {
     echo " CONFIGURAÇÃO ANTERIOR ENCONTRADA"
     echo "============================================================"
 
+    # shellcheck disable=SC1090
     source "$CONFIG_FILE"
+
+    CONFIG_LOADED="yes"
 
     echo "Arquivo carregado:"
     echo "$CONFIG_FILE"
     echo ""
-
-    USE_PREVIOUS="$(ask_yes_no "Usar respostas salvas da última instalação?" "S")"
-
-    if [ "$USE_PREVIOUS" != "yes" ]; then
-      rm -f "$CONFIG_FILE"
-
-      unset AGENT_PUBLIC_IP
-      unset LETSENCRYPT_EMAIL
-      unset TRAEFIK_VERSION
-      unset PORTAINER_AGENT_VERSION
-      unset SSL_METHOD
-      unset CLOUDFLARE_EMAIL
-      unset CLOUDFLARE_DNS_API_TOKEN
-      unset INSTALL_UFW
-      unset ALLOW_SSH
-      unset SSH_PORT
-
-      echo "Configuração anterior removida."
-    fi
+    echo "As respostas salvas serão reutilizadas automaticamente."
+    echo "Para refazer as perguntas, execute:"
+    echo "FORCE_RECONFIG=1 bash $0"
+    echo ""
   fi
 }
 
 save_config() {
-  cat > "$CONFIG_FILE" <<EOF
-AGENT_PUBLIC_IP="${AGENT_PUBLIC_IP}"
-LETSENCRYPT_EMAIL="${LETSENCRYPT_EMAIL}"
-TRAEFIK_VERSION="${TRAEFIK_VERSION}"
-PORTAINER_AGENT_VERSION="${PORTAINER_AGENT_VERSION}"
-SSL_METHOD="${SSL_METHOD}"
-CLOUDFLARE_EMAIL="${CLOUDFLARE_EMAIL}"
-CLOUDFLARE_DNS_API_TOKEN="${CLOUDFLARE_DNS_API_TOKEN}"
-INSTALL_UFW="${INSTALL_UFW}"
-ALLOW_SSH="${ALLOW_SSH}"
-SSH_PORT="${SSH_PORT}"
-EOF
+  : > "$CONFIG_FILE"
+
+  write_config_value "AGENT_PUBLIC_IP" "${AGENT_PUBLIC_IP}"
+  write_config_value "LETSENCRYPT_EMAIL" "${LETSENCRYPT_EMAIL}"
+  write_config_value "TRAEFIK_VERSION" "${TRAEFIK_VERSION}"
+  write_config_value "PORTAINER_AGENT_VERSION" "${PORTAINER_AGENT_VERSION}"
+  write_config_value "SSL_METHOD" "${SSL_METHOD}"
+  write_config_value "CLOUDFLARE_EMAIL" "${CLOUDFLARE_EMAIL}"
+  write_config_value "CLOUDFLARE_DNS_API_TOKEN" "${CLOUDFLARE_DNS_API_TOKEN}"
+  write_config_value "INSTALL_UFW" "${INSTALL_UFW}"
+  write_config_value "ALLOW_SSH" "${ALLOW_SSH}"
+  write_config_value "SSH_PORT" "${SSH_PORT}"
 
   chmod 600 "$CONFIG_FILE"
 
   echo ""
   echo "Configuração salva em:"
   echo "$CONFIG_FILE"
+}
+
+# ============================================================
+# DOCKER REPOSITORY
+# ============================================================
+
+configure_docker_repository() {
+  echo ""
+  echo "[3/11] Configurando repositório Docker..."
+
+  rm -f /etc/apt/sources.list.d/docker.list
+  rm -f /etc/apt/sources.list.d/docker.sources
+  rm -f /etc/apt/keyrings/docker.asc
+
+  apt-get clean
+  rm -rf /var/lib/apt/lists/*
+
+  install -m 0755 -d /etc/apt/keyrings
+
+  echo ""
+  echo "Baixando chave GPG oficial do Docker..."
+
+  curl -fsSL \
+    "https://download.docker.com/linux/${DOCKER_DISTRO}/gpg" \
+    -o /etc/apt/keyrings/docker.asc
+
+  chmod a+r /etc/apt/keyrings/docker.asc
+
+  ARCH="$(dpkg --print-architecture)"
+
+  cat > /etc/apt/sources.list.d/docker.sources <<EOF
+Types: deb
+URIs: https://download.docker.com/linux/${DOCKER_DISTRO}
+Suites: ${DISTRO_CODENAME}
+Components: stable
+Architectures: ${ARCH}
+Signed-By: /etc/apt/keyrings/docker.asc
+EOF
+
+  echo ""
+  echo "Repositório Docker configurado:"
+  echo "------------------------------------------------------------"
+  cat /etc/apt/sources.list.d/docker.sources
+  echo "------------------------------------------------------------"
+
+  echo ""
+  echo "Atualizando índices APT..."
+  run_apt_update
+
+  echo ""
+  echo "Validando repositório Docker..."
+
+  if [ ! -f /etc/apt/sources.list.d/docker.sources ]; then
+    echo "ERRO: arquivo docker.sources não foi criado."
+    exit 1
+  fi
+
+  if ! grep -q "download.docker.com/linux/${DOCKER_DISTRO}" /etc/apt/sources.list.d/docker.sources; then
+    echo "ERRO: repositório Docker não configurado corretamente."
+    exit 1
+  fi
+
+  if ! apt-cache show docker-ce >/dev/null 2>&1; then
+    echo "ERRO: pacote docker-ce não apareceu no cache do APT."
+    echo ""
+    echo "Debug:"
+    echo "------------------------------------------------------------"
+    apt-cache policy docker-ce || true
+    echo "------------------------------------------------------------"
+    echo ""
+    echo "Verifique se a distro/codename é suportada pelo Docker:"
+    echo "Distro:   ${DOCKER_DISTRO}"
+    echo "Codename: ${DISTRO_CODENAME}"
+    echo "Arch:     ${ARCH}"
+    exit 1
+  fi
+
+  if apt-cache policy docker-ce | grep -q "Candidate: (none)"; then
+    echo "ERRO: docker-ce apareceu no cache, mas sem candidato de instalação."
+    echo ""
+    echo "Debug:"
+    echo "------------------------------------------------------------"
+    apt-cache policy docker-ce || true
+    echo "------------------------------------------------------------"
+    exit 1
+  fi
+
+  echo "OK: repositório Docker validado."
 }
 
 # ============================================================
@@ -322,26 +476,29 @@ if [ -z "$AGENT_PUBLIC_IP_DEFAULT" ]; then
   AGENT_PUBLIC_IP_DEFAULT="IP_DESTE_SERVIDOR"
 fi
 
-AGENT_PUBLIC_IP="$(ask_default \
+AGENT_PUBLIC_IP="$(ask_saved_or_default \
+  "AGENT_PUBLIC_IP" \
   "IP público deste servidor Agent" \
   "$AGENT_PUBLIC_IP_DEFAULT")"
 
-LETSENCRYPT_EMAIL="$(ask_default \
+LETSENCRYPT_EMAIL="$(ask_saved_or_default \
+  "LETSENCRYPT_EMAIL" \
   "E-mail para Let's Encrypt" \
   "${LETSENCRYPT_EMAIL:-$DEFAULT_LETSENCRYPT_EMAIL}")"
 
-TRAEFIK_VERSION="$(ask_default \
+TRAEFIK_VERSION="$(ask_saved_or_default \
+  "TRAEFIK_VERSION" \
   "Versão do Traefik" \
   "${TRAEFIK_VERSION:-$DEFAULT_TRAEFIK_VERSION}")"
 
-PORTAINER_AGENT_VERSION="$(ask_default \
+PORTAINER_AGENT_VERSION="$(ask_saved_or_default \
+  "PORTAINER_AGENT_VERSION" \
   "Versão do Portainer Agent" \
   "${PORTAINER_AGENT_VERSION:-$DEFAULT_PORTAINER_AGENT_VERSION}")"
 
-if [ -n "${SSL_METHOD:-}" ]; then
-  SSL_METHOD="$(ask_default \
-    "Método SSL (http/cloudflare)" \
-    "$SSL_METHOD")"
+if [ "$CONFIG_LOADED" = "yes" ] && [ "$FORCE_RECONFIG" != "1" ] && [ -n "${SSL_METHOD:-}" ]; then
+  echo "Usando valor salvo: Método SSL" >&2
+  SSL_METHOD="${SSL_METHOD}"
 else
   SSL_METHOD="$(ask_ssl_method)"
 fi
@@ -353,21 +510,14 @@ if [ "$SSL_METHOD" = "cloudflare" ]; then
   echo ""
   echo "Configuração Cloudflare"
 
-  CLOUDFLARE_EMAIL="$(ask_default \
+  CLOUDFLARE_EMAIL="$(ask_saved_or_default \
+    "CLOUDFLARE_EMAIL" \
     "E-mail Cloudflare" \
     "$CLOUDFLARE_EMAIL")"
 
-  if [ -n "$CLOUDFLARE_DNS_API_TOKEN" ]; then
-    USE_SAVED_CF_TOKEN="$(ask_yes_no \
-      "Usar token Cloudflare salvo?" \
-      "S")"
-
-    if [ "$USE_SAVED_CF_TOKEN" != "yes" ]; then
-      CLOUDFLARE_DNS_API_TOKEN=""
-    fi
-  fi
-
-  if [ -z "$CLOUDFLARE_DNS_API_TOKEN" ]; then
+  if [ "$CONFIG_LOADED" = "yes" ] && [ "$FORCE_RECONFIG" != "1" ] && [ -n "$CLOUDFLARE_DNS_API_TOKEN" ]; then
+    echo "Usando token Cloudflare salvo." >&2
+  else
     printf "Cloudflare API Token: " >&2
     read -r -s CLOUDFLARE_DNS_API_TOKEN
     echo ""
@@ -377,25 +527,37 @@ if [ "$SSL_METHOD" = "cloudflare" ]; then
       exit 1
     fi
   fi
+else
+  CLOUDFLARE_EMAIL=""
+  CLOUDFLARE_DNS_API_TOKEN=""
 fi
 
-INSTALL_UFW="$(ask_default \
+INSTALL_UFW="$(ask_saved_or_default \
+  "INSTALL_UFW" \
   "Instalar/configurar UFW? (yes/no)" \
   "${INSTALL_UFW:-yes}")"
+
+INSTALL_UFW="$(normalize_yes_no_value "$INSTALL_UFW")"
 
 ALLOW_SSH="${ALLOW_SSH:-yes}"
 SSH_PORT="${SSH_PORT:-$DEFAULT_SSH_PORT}"
 
 if [ "$INSTALL_UFW" = "yes" ]; then
-  ALLOW_SSH="$(ask_default \
+  ALLOW_SSH="$(ask_saved_or_default \
+    "ALLOW_SSH" \
     "Liberar SSH? (yes/no)" \
     "$ALLOW_SSH")"
 
+  ALLOW_SSH="$(normalize_yes_no_value "$ALLOW_SSH")"
+
   if [ "$ALLOW_SSH" = "yes" ]; then
-    SSH_PORT="$(ask_default \
+    SSH_PORT="$(ask_saved_or_default \
+      "SSH_PORT" \
       "Porta SSH" \
       "$SSH_PORT")"
   fi
+else
+  ALLOW_SSH="no"
 fi
 
 save_config
@@ -410,9 +572,9 @@ echo "============================================================"
 echo ""
 echo "[1/11] Atualizando pacotes..."
 
-apt update
+run_apt_update
 
-apt install -y \
+apt-get install -y \
   ca-certificates \
   curl \
   gnupg \
@@ -426,61 +588,21 @@ apt install -y \
 echo ""
 echo "[2/11] Removendo Docker antigo..."
 
-apt remove -y \
+apt-get remove -y \
   docker.io \
   docker-doc \
   docker-compose \
+  docker-compose-v2 \
   podman-docker \
   containerd \
   runc || true
 
-echo ""
-echo "[3/11] Configurando repositório Docker..."
-
-rm -f /etc/apt/sources.list.d/docker.list
-rm -f /etc/apt/keyrings/docker.asc
-
-apt clean
-rm -rf /var/lib/apt/lists/*
-
-install -m 0755 -d /etc/apt/keyrings
-
-curl -fsSL \
-  "https://download.docker.com/linux/${DOCKER_DISTRO}/gpg" \
-  -o /etc/apt/keyrings/docker.asc
-
-chmod a+r /etc/apt/keyrings/docker.asc
-
-ARCH="$(dpkg --print-architecture)"
-
-echo \
-"deb [arch=${ARCH} signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/${DOCKER_DISTRO} ${DISTRO_CODENAME} stable" \
-> /etc/apt/sources.list.d/docker.list
-
-echo ""
-echo "Atualizando índices APT..."
-
-apt update
-
-echo ""
-echo "Validando repositório Docker..."
-
-if ! grep -q "download.docker.com" /etc/apt/sources.list.d/docker.list; then
-  echo "ERRO: repositório Docker não configurado."
-  exit 1
-fi
-
-if ! apt-cache policy docker-ce | grep -q "download.docker.com"; then
-  echo "ERRO: Docker repo não apareceu no apt-cache."
-  exit 1
-fi
-
-echo "OK: repositório Docker validado."
+configure_docker_repository
 
 echo ""
 echo "[4/11] Instalando Docker..."
 
-apt install -y \
+apt-get install -y \
   docker-ce \
   docker-ce-cli \
   containerd.io \

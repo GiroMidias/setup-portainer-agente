@@ -18,12 +18,12 @@ set -euo pipefail
 # 5. Cria redes overlay proxy e public_network
 # 6. Sobe Traefik como stack Swarm
 # 7. Pergunta dados SSH do Portainer principal
-# 8. Vai ao servidor principal conferir se já existe AGENT_SECRET
-# 9. Se existir, reutiliza; se não existir, cria um novo no principal
-# 10. Aplica AGENT_SECRET no Portainer Server e nos Agents existentes
+# 8. Busca primeiro o AGENT_SECRET em /root/portainer-agent-secret.txt no principal
+# 9. Se nao existir no arquivo, tenta detectar no Docker; so cria novo se realmente nao existir
+# 10. Aplica AGENT_SECRET no Portainer principal e nos Agents existentes
 # 11. Sobe Portainer Agent local usando o mesmo AGENT_SECRET
 # 12. Libera o IP do servidor principal para conectar neste Agent
-# 13. Valida conexão do principal para este Agent
+# 13. Valida conexao do principal para este Agent
 # ============================================================
 
 STACK_DIR="/opt/stacks/traefik-portainer-agent"
@@ -44,18 +44,14 @@ CONFIG_FILE="/root/install-traefik-portainer-agent.conf"
 CONFIG_LOADED="no"
 FORCE_RECONFIG="${FORCE_RECONFIG:-0}"
 
-# ============================================================
-# DETECÇÃO DO SISTEMA OPERACIONAL
-# ============================================================
-
 detect_os() {
   echo ""
   echo "============================================================"
-  echo " DETECÇÃO DO SISTEMA OPERACIONAL"
+  echo " DETECCAO DO SISTEMA OPERACIONAL"
   echo "============================================================"
 
   if [ ! -f /etc/os-release ]; then
-    echo "ERRO: não foi possível detectar o sistema operacional."
+    echo "ERRO: nao foi possivel detectar o sistema operacional."
     exit 1
   fi
 
@@ -75,7 +71,7 @@ detect_os() {
       DISTRO_CODENAME="${UBUNTU_CODENAME:-${VERSION_CODENAME:-}}"
       ;;
     *)
-      echo "ERRO: sistema operacional não suportado."
+      echo "ERRO: sistema operacional nao suportado."
       echo ""
       echo "Sistema detectado: $DISTRO_NAME"
       echo ""
@@ -87,7 +83,7 @@ detect_os() {
   esac
 
   if [ -z "$DISTRO_CODENAME" ]; then
-    echo "ERRO: não foi possível detectar o codename da distro."
+    echo "ERRO: nao foi possivel detectar o codename da distro."
     exit 1
   fi
 
@@ -96,7 +92,7 @@ detect_os() {
   echo ""
   echo "Sistema detectado:"
   echo "------------------------------------------------------------"
-  echo "Distribuição:      $DISTRO_NAME"
+  echo "Distribuicao:      $DISTRO_NAME"
   echo "ID:                $DISTRO_ID"
   echo "Codename:          $DISTRO_CODENAME"
   echo "Arquitetura:       $ARCH"
@@ -104,10 +100,6 @@ detect_os() {
   echo "------------------------------------------------------------"
   echo ""
 }
-
-# ============================================================
-# INPUTS
-# ============================================================
 
 ask_required() {
   local prompt="$1"
@@ -118,7 +110,7 @@ ask_required() {
     read -r value
 
     if [ -z "$value" ]; then
-      echo "Campo obrigatório." >&2
+      echo "Campo obrigatorio." >&2
     fi
   done
 
@@ -165,44 +157,18 @@ ask_saved_or_required() {
   ask_required "$prompt"
 }
 
-ask_yes_no() {
-  local prompt="$1"
-  local default_value="$2"
-  local value=""
-
-  while true; do
-    printf "%s [%s]: " "$prompt" "$default_value" >&2
-    read -r value
-    value="${value:-$default_value}"
-
-    case "$value" in
-      S|s|Y|y|sim|SIM|Sim|yes|YES|Yes)
-        echo "yes"
-        return
-        ;;
-      N|n|nao|NAO|Nao|não|NÃO|Não|no|NO|No)
-        echo "no"
-        return
-        ;;
-      *)
-        echo "Responda com S ou N." >&2
-        ;;
-    esac
-  done
-}
-
 ask_ssl_method() {
   local value=""
 
   echo "" >&2
-  echo "Escolha o método de SSL do Traefik:" >&2
+  echo "Escolha o metodo de SSL do Traefik:" >&2
   echo "" >&2
-  echo "1) SEM Cloudflare - HTTP Challenge padrão" >&2
+  echo "1) SEM Cloudflare - HTTP Challenge padrao" >&2
   echo "2) COM Cloudflare - DNS Challenge" >&2
   echo "" >&2
 
   while true; do
-    printf "Método SSL [1=sem Cloudflare / 2=com Cloudflare]: " >&2
+    printf "Metodo SSL [1=sem Cloudflare / 2=com Cloudflare]: " >&2
     read -r value
     value="${value:-1}"
 
@@ -220,14 +186,6 @@ ask_ssl_method() {
         ;;
     esac
   done
-}
-
-# ============================================================
-# HELPERS
-# ============================================================
-
-generate_secret() {
-  openssl rand -hex 32
 }
 
 detect_public_ip() {
@@ -251,7 +209,7 @@ run_apt_update() {
     attempt=$((attempt + 1))
   done
 
-  echo "ERRO: apt-get update falhou após $max_attempts tentativas."
+  echo "ERRO: apt-get update falhou apos $max_attempts tentativas."
   exit 1
 }
 
@@ -259,15 +217,9 @@ normalize_yes_no_value() {
   local value="$1"
 
   case "$value" in
-    S|s|Y|y|sim|SIM|Sim|yes|YES|Yes)
-      echo "yes"
-      ;;
-    N|n|nao|NAO|Nao|não|NÃO|Não|no|NO|No)
-      echo "no"
-      ;;
-    *)
-      echo "$value"
-      ;;
+    S|s|Y|y|sim|SIM|Sim|yes|YES|Yes) echo "yes" ;;
+    N|n|nao|NAO|Nao|não|NÃO|Não|no|NO|No) echo "no" ;;
+    *) echo "$value" ;;
   esac
 }
 
@@ -280,19 +232,14 @@ write_config_value() {
 
 is_ipv4() {
   local ip="$1"
-
   [[ "$ip" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]
 }
-
-# ============================================================
-# PERSISTÊNCIA DE CONFIGURAÇÃO
-# ============================================================
 
 load_previous_config() {
   if [ -f "$CONFIG_FILE" ]; then
     echo ""
     echo "============================================================"
-    echo " CONFIGURAÇÃO ANTERIOR ENCONTRADA"
+    echo " CONFIGURACAO ANTERIOR ENCONTRADA"
     echo "============================================================"
 
     # shellcheck disable=SC1090
@@ -303,7 +250,7 @@ load_previous_config() {
     echo "Arquivo carregado:"
     echo "$CONFIG_FILE"
     echo ""
-    echo "As respostas salvas serão reutilizadas automaticamente."
+    echo "As respostas salvas serao reutilizadas automaticamente."
     echo "Para refazer as perguntas, execute:"
     echo "FORCE_RECONFIG=1 bash $0"
     echo ""
@@ -330,17 +277,13 @@ save_config() {
   chmod 600 "$CONFIG_FILE"
 
   echo ""
-  echo "Configuração salva em:"
+  echo "Configuracao salva em:"
   echo "$CONFIG_FILE"
 }
 
-# ============================================================
-# DOCKER REPOSITORY
-# ============================================================
-
 configure_docker_repository() {
   echo ""
-  echo "[3/12] Configurando repositório Docker..."
+  echo "[3/12] Configurando repositorio Docker..."
 
   rm -f /etc/apt/sources.list.d/docker.list
   rm -f /etc/apt/sources.list.d/docker.sources
@@ -372,37 +315,37 @@ Signed-By: /etc/apt/keyrings/docker.asc
 EOF
 
   echo ""
-  echo "Repositório Docker configurado:"
+  echo "Repositorio Docker configurado:"
   echo "------------------------------------------------------------"
   cat /etc/apt/sources.list.d/docker.sources
   echo "------------------------------------------------------------"
 
   echo ""
-  echo "Atualizando índices APT..."
+  echo "Atualizando indices APT..."
   run_apt_update
 
   echo ""
-  echo "Validando repositório Docker..."
+  echo "Validando repositorio Docker..."
 
   if [ ! -f /etc/apt/sources.list.d/docker.sources ]; then
-    echo "ERRO: arquivo docker.sources não foi criado."
+    echo "ERRO: arquivo docker.sources nao foi criado."
     exit 1
   fi
 
   if ! grep -q "download.docker.com/linux/${DOCKER_DISTRO}" /etc/apt/sources.list.d/docker.sources; then
-    echo "ERRO: repositório Docker não configurado corretamente."
+    echo "ERRO: repositorio Docker nao configurado corretamente."
     exit 1
   fi
 
   if ! apt-cache show docker-ce >/dev/null 2>&1; then
-    echo "ERRO: pacote docker-ce não apareceu no cache do APT."
+    echo "ERRO: pacote docker-ce nao apareceu no cache do APT."
     echo ""
     echo "Debug:"
     echo "------------------------------------------------------------"
     apt-cache policy docker-ce || true
     echo "------------------------------------------------------------"
     echo ""
-    echo "Verifique se a distro/codename é suportada pelo Docker:"
+    echo "Verifique se a distro/codename e suportada pelo Docker:"
     echo "Distro:   ${DOCKER_DISTRO}"
     echo "Codename: ${DISTRO_CODENAME}"
     echo "Arch:     ${ARCH}"
@@ -410,7 +353,7 @@ EOF
   fi
 
   if apt-cache policy docker-ce | grep -q "Candidate: (none)"; then
-    echo "ERRO: docker-ce apareceu no cache, mas sem candidato de instalação."
+    echo "ERRO: docker-ce apareceu no cache, mas sem candidato de instalacao."
     echo ""
     echo "Debug:"
     echo "------------------------------------------------------------"
@@ -419,12 +362,8 @@ EOF
     exit 1
   fi
 
-  echo "OK: repositório Docker validado."
+  echo "OK: repositorio Docker validado."
 }
-
-# ============================================================
-# NETWORKS
-# ============================================================
 
 ensure_overlay_network() {
   local network_name="$1"
@@ -436,11 +375,11 @@ ensure_overlay_network() {
     DRIVER="$(docker network inspect "$network_name" --format '{{.Driver}}')"
 
     if [ "$DRIVER" = "overlay" ]; then
-      echo "OK: rede '$network_name' já existe."
+      echo "OK: rede '$network_name' ja existe."
       return
     fi
 
-    echo "Rede existe mas não é overlay."
+    echo "Rede existe mas nao e overlay."
     echo "Removendo e recriando..."
 
     docker network rm "$network_name" || true
@@ -454,10 +393,6 @@ ensure_overlay_network() {
   echo "OK: rede '$network_name' criada."
 }
 
-# ============================================================
-# DOCKER SWARM
-# ============================================================
-
 ensure_swarm_manager() {
   echo ""
   echo "[5/12] Validando Docker Swarm..."
@@ -469,12 +404,12 @@ ensure_swarm_manager() {
   control_available="$(docker info --format '{{.Swarm.ControlAvailable}}' 2>/dev/null || echo "false")"
 
   if [ "$swarm_state" = "active" ] && [ "$control_available" = "true" ]; then
-    echo "OK: este servidor já é manager Swarm."
+    echo "OK: este servidor ja e manager Swarm."
     return
   fi
 
   if [ "$swarm_state" = "active" ] && [ "$control_available" != "true" ]; then
-    echo "ERRO: este servidor já está em um Swarm, mas não é manager."
+    echo "ERRO: este servidor ja esta em um Swarm, mas nao e manager."
     echo "Este instalador precisa rodar em um manager Swarm."
     exit 1
   fi
@@ -485,10 +420,6 @@ ensure_swarm_manager() {
 
   echo "OK: Docker Swarm inicializado."
 }
-
-# ============================================================
-# TRAEFIK
-# ============================================================
 
 render_traefik_stack() {
   echo ""
@@ -621,10 +552,6 @@ deploy_traefik_stack() {
   echo "OK: stack do Traefik enviada para o Swarm."
 }
 
-# ============================================================
-# SSH SERVIDOR PRINCIPAL
-# ============================================================
-
 collect_main_server_data() {
   echo ""
   echo "============================================================"
@@ -632,16 +559,16 @@ collect_main_server_data() {
   echo "============================================================"
   echo ""
   echo "Agora informe o servidor principal onde o Portainer Server roda."
-  echo "Este servidor será usado para buscar/criar o AGENT_SECRET."
+  echo "Este servidor sera usado para buscar o AGENT_SECRET ja existente."
   echo ""
 
   MAIN_SERVER_IP="$(ask_saved_or_required \
     "MAIN_SERVER_IP" \
-    "IP público do servidor principal do Portainer: ")"
+    "IP publico do servidor principal do Portainer: ")"
 
   MAIN_SERVER_SSH_USER="$(ask_saved_or_default \
     "MAIN_SERVER_SSH_USER" \
-    "Usuário SSH do servidor principal" \
+    "Usuario SSH do servidor principal" \
     "${MAIN_SERVER_SSH_USER:-$DEFAULT_MAIN_SERVER_SSH_USER}")"
 
   MAIN_SERVER_SSH_PORT="$(ask_saved_or_default \
@@ -678,15 +605,15 @@ test_main_server_ssh() {
   echo "[9/12] Testando SSH com o servidor principal..."
 
   if ! ssh_main "echo OK" >/dev/null; then
-    echo "ERRO: não foi possível conectar via SSH no servidor principal."
+    echo "ERRO: nao foi possivel conectar via SSH no servidor principal."
     echo ""
     echo "Dados usados:"
     echo "Servidor: ${MAIN_SERVER_IP}"
-    echo "Usuário:  ${MAIN_SERVER_SSH_USER}"
+    echo "Usuario:  ${MAIN_SERVER_SSH_USER}"
     echo "Porta:    ${MAIN_SERVER_SSH_PORT}"
     echo ""
     echo "Corrija o acesso SSH e rode novamente."
-    echo "As respostas já ficaram salvas em:"
+    echo "As respostas ja ficaram salvas em:"
     echo "$CONFIG_FILE"
     exit 1
   fi
@@ -706,20 +633,36 @@ else
   SUDO="sudo"
 fi
 
+normalize_secret() {
+  sed -n 's/^AGENT_SECRET=//p' 2>/dev/null \
+    | sed 's/^\(AGENT_SECRET=\)\+//' \
+    | awk 'NF {print; exit}'
+}
+
 read_secret_file() {
-  if $SUDO test -s "$SECRET_FILE" 2>/dev/null; then
-    $SUDO cat "$SECRET_FILE" 2>/dev/null | head -n 1 | tr -d '\r\n'
-    echo ""
+  local raw=""
+  local normalized=""
+  if ! $SUDO test -s "$SECRET_FILE" 2>/dev/null; then
+    return 1
+  fi
+
+  raw="$($SUDO cat "$SECRET_FILE" 2>/dev/null | tr -d '\r' || true)"
+  if [ -z "$raw" ]; then
+    return 1
+  fi
+
+  normalized="$(printf "%s\n" "$raw" | normalize_secret | head -n 1 || true)"
+  if [ -n "$normalized" ]; then
+    printf "%s\n" "$normalized"
     return 0
   fi
 
-  return 1
+  printf "%s\n" "$raw" | awk 'NF {print; exit}'
 }
 
 save_secret_file() {
   local secret="$1"
-
-  printf "%s\n" "$secret" | $SUDO tee "$SECRET_FILE" >/dev/null
+  printf "AGENT_SECRET=%s\n" "$secret" | $SUDO tee "$SECRET_FILE" >/dev/null
   $SUDO chmod 600 "$SECRET_FILE" >/dev/null 2>&1 || true
 }
 
@@ -734,8 +677,7 @@ find_secret_in_docker_services() {
   if [ -n "$services" ]; then
     for service in $services; do
       local secret
-      secret="$($SUDO docker service inspect "$service" --format '{{range .Spec.TaskTemplate.ContainerSpec.Env}}{{println .}}{{end}}' 2>/dev/null | awk -F= '$1=="AGENT_SECRET"{sub(/^AGENT_SECRET=/,""); print; exit}' || true)"
-
+      secret="$($SUDO docker service inspect "$service" --format '{{range .Spec.TaskTemplate.ContainerSpec.Env}}{{println .}}{{end}}' 2>/dev/null | normalize_secret || true)"
       if [ -n "$secret" ]; then
         printf "%s\n" "$secret"
         return 0
@@ -757,8 +699,7 @@ find_secret_in_docker_containers() {
   if [ -n "$containers" ]; then
     for container in $containers; do
       local secret
-      secret="$($SUDO docker inspect "$container" --format '{{range .Config.Env}}{{println .}}{{end}}' 2>/dev/null | awk -F= '$1=="AGENT_SECRET"{sub(/^AGENT_SECRET=/,""); print; exit}' || true)"
-
+      secret="$($SUDO docker inspect "$container" --format '{{range .Config.Env}}{{println .}}{{end}}' 2>/dev/null | normalize_secret || true)"
       if [ -n "$secret" ]; then
         printf "%s\n" "$secret"
         return 0
@@ -781,6 +722,7 @@ create_new_secret() {
 
 SECRET=""
 
+# Sempre prioriza o arquivo padrao em /root, porque e onde o script salva por default.
 SECRET="$(read_secret_file || true)"
 
 if [ -z "$SECRET" ]; then
@@ -792,16 +734,17 @@ if [ -z "$SECRET" ]; then
 fi
 
 if [ -z "$SECRET" ]; then
+  echo "AVISO: AGENT_SECRET nao encontrado no arquivo nem no Docker do principal."
+  echo "AVISO: criando novo AGENT_SECRET no servidor principal."
   SECRET="$(create_new_secret)"
 fi
 
 if [ -z "$SECRET" ]; then
-  echo "ERRO: não foi possível obter/criar AGENT_SECRET." >&2
+  echo "ERRO: nao foi possivel obter/criar AGENT_SECRET." >&2
   exit 1
 fi
 
 save_secret_file "$SECRET"
-
 printf "%s\n" "$SECRET"
 REMOTE_SCRIPT
 }
@@ -814,6 +757,7 @@ apply_agent_secret_to_principal() {
 set -euo pipefail
 
 SECRET="$1"
+SECRET_FILE="/root/portainer-agent-secret.txt"
 
 if [ "$(id -u)" -eq 0 ]; then
   SUDO=""
@@ -821,9 +765,12 @@ else
   SUDO="sudo"
 fi
 
+printf "AGENT_SECRET=%s\n" "$SECRET" | $SUDO tee "$SECRET_FILE" >/dev/null
+$SUDO chmod 600 "$SECRET_FILE" >/dev/null 2>&1 || true
+
 if ! command -v docker >/dev/null 2>&1; then
-  echo "AVISO: Docker não encontrado no servidor principal."
-  echo "O secret foi salvo, mas não foi possível atualizar serviços Docker."
+  echo "AVISO: Docker nao encontrado no servidor principal."
+  echo "O secret foi salvo, mas nao foi possivel atualizar servicos Docker."
   exit 0
 fi
 
@@ -857,15 +804,15 @@ if [ "$UPDATED_ANY" = "no" ]; then
     echo "AVISO: Portainer Server parece estar rodando como container standalone:"
     echo "$PORTAINER_CONTAINERS"
     echo ""
-    echo "Não dá para alterar variável AGENT_SECRET em container já criado sem recriar o container."
+    echo "Nao da para alterar variavel AGENT_SECRET em container ja criado sem recriar o container."
     echo "O secret foi salvo em /root/portainer-agent-secret.txt no servidor principal."
   else
-    echo "AVISO: não encontrei service/container do Portainer Server no servidor principal."
+    echo "AVISO: nao encontrei service/container do Portainer Server no servidor principal."
     echo "O secret foi salvo em /root/portainer-agent-secret.txt no servidor principal."
   fi
 fi
 
-echo "OK: verificação/aplicação do AGENT_SECRET no principal concluída."
+echo "OK: verificacao/aplicacao do AGENT_SECRET no principal concluida."
 REMOTE_SCRIPT
 }
 
@@ -873,28 +820,24 @@ save_agent_secret_locally() {
   echo ""
   echo "Salvando AGENT_SECRET neste servidor Agent..."
 
-  printf "%s\n" "$AGENT_SECRET" > "$AGENT_SECRET_FILE"
+  printf "AGENT_SECRET=%s\n" "$AGENT_SECRET" > "$AGENT_SECRET_FILE"
   chmod 600 "$AGENT_SECRET_FILE"
 
   echo "OK: secret salvo em $AGENT_SECRET_FILE"
 }
-
-# ============================================================
-# PORTAINER AGENT
-# ============================================================
 
 deploy_portainer_agent() {
   echo ""
   echo "[11/12] Subindo Portainer Agent protegido por AGENT_SECRET..."
 
   if docker service inspect "$PORTAINER_AGENT_SERVICE_NAME" >/dev/null 2>&1; then
-    echo "Service $PORTAINER_AGENT_SERVICE_NAME já existe. Removendo para recriar limpo..."
+    echo "Service $PORTAINER_AGENT_SERVICE_NAME ja existe. Removendo para recriar limpo..."
     docker service rm "$PORTAINER_AGENT_SERVICE_NAME" >/dev/null || true
 
     local attempt=1
     while docker service inspect "$PORTAINER_AGENT_SERVICE_NAME" >/dev/null 2>&1; do
       if [ "$attempt" -gt 30 ]; then
-        echo "ERRO: service antigo do Portainer Agent não foi removido."
+        echo "ERRO: service antigo do Portainer Agent nao foi removido."
         exit 1
       fi
 
@@ -926,7 +869,7 @@ wait_for_portainer_agent() {
 
   while [ "$attempt" -le "$max_attempts" ]; do
     if docker service ps "$PORTAINER_AGENT_SERVICE_NAME" --format '{{.CurrentState}}' 2>/dev/null | grep -q "Running"; then
-      echo "OK: Portainer Agent está em execução."
+      echo "OK: Portainer Agent esta em execucao."
       return
     fi
 
@@ -934,28 +877,23 @@ wait_for_portainer_agent() {
     attempt=$((attempt + 1))
   done
 
-  echo "AVISO: não consegui confirmar o Agent como Running dentro do tempo esperado."
+  echo "AVISO: nao consegui confirmar o Agent como Running dentro do tempo esperado."
   echo ""
   docker service ps "$PORTAINER_AGENT_SERVICE_NAME" || true
 }
-
-# ============================================================
-# FIREWALL
-# ============================================================
 
 configure_ufw() {
   echo ""
   echo "[12/12] Configurando firewall..."
 
   if [ "$INSTALL_UFW" != "yes" ]; then
-    echo "UFW desativado pela configuração. Pulando firewall."
+    echo "UFW desativado pela configuracao. Pulando firewall."
     return
   fi
 
   apt-get install -y ufw
 
   ufw --force reset
-
   ufw default deny incoming
   ufw default allow outgoing
 
@@ -970,7 +908,7 @@ configure_ufw() {
     ufw allow from "$MAIN_SERVER_IP" to any port 9001 proto tcp
     echo "OK: servidor principal liberado para acessar o Agent na porta 9001."
   else
-    echo "AVISO: MAIN_SERVER_IP não parece ser IPv4 puro: $MAIN_SERVER_IP"
+    echo "AVISO: MAIN_SERVER_IP nao parece ser IPv4 puro: $MAIN_SERVER_IP"
     echo "Liberando porta 9001/tcp de forma geral para evitar bloqueio."
     ufw allow 9001/tcp
   fi
@@ -980,13 +918,9 @@ configure_ufw() {
   echo "OK: UFW configurado."
 }
 
-# ============================================================
-# VALIDAÇÃO PRINCIPAL -> AGENT
-# ============================================================
-
 validate_main_server_can_reach_agent() {
   echo ""
-  echo "Validando conexão do servidor principal para este Agent..."
+  echo "Validando conexao do servidor principal para este Agent..."
 
   if ssh_main_bash "$AGENT_PUBLIC_IP" <<'REMOTE_SCRIPT'
 set -euo pipefail
@@ -1006,46 +940,29 @@ fi
 exit 1
 REMOTE_SCRIPT
   then
-    echo "OK: servidor principal conseguiu alcançar este Agent na porta 9001."
+    echo "OK: servidor principal conseguiu alcancar este Agent na porta 9001."
   else
-    echo "AVISO: o servidor principal não conseguiu validar conexão na porta 9001."
+    echo "AVISO: o servidor principal nao conseguiu validar conexao na porta 9001."
     echo ""
     echo "Confira:"
-    echo "  - IP público deste Agent: $AGENT_PUBLIC_IP"
+    echo "  - IP publico deste Agent: $AGENT_PUBLIC_IP"
     echo "  - Porta liberada: 9001/tcp"
     echo "  - Firewall externo do provedor"
     echo "  - Security group, se existir"
-    echo "  - Se o Agent já terminou de iniciar"
+    echo "  - Se o Agent ja terminou de iniciar"
   fi
 }
-
-# ============================================================
-# ROOT CHECK
-# ============================================================
 
 if [ "$(id -u)" -ne 0 ]; then
   echo "ERRO: execute como root."
   exit 1
 fi
 
-# ============================================================
-# DETECT OS
-# ============================================================
-
 detect_os
-
-# ============================================================
-# LOAD CONFIG
-# ============================================================
-
 load_previous_config
 
-# ============================================================
-# ETAPA 1
-# ============================================================
-
 echo "============================================================"
-echo " ETAPA 1: DADOS DA INSTALAÇÃO LOCAL"
+echo " ETAPA 1: DADOS DA INSTALACAO LOCAL"
 echo "============================================================"
 
 AGENT_PUBLIC_IP_DEFAULT="${AGENT_PUBLIC_IP:-$(detect_public_ip)}"
@@ -1056,7 +973,7 @@ fi
 
 AGENT_PUBLIC_IP="$(ask_saved_or_default \
   "AGENT_PUBLIC_IP" \
-  "IP público deste servidor Agent" \
+  "IP publico deste servidor Agent" \
   "$AGENT_PUBLIC_IP_DEFAULT")"
 
 LETSENCRYPT_EMAIL="$(ask_saved_or_default \
@@ -1066,16 +983,16 @@ LETSENCRYPT_EMAIL="$(ask_saved_or_default \
 
 TRAEFIK_VERSION="$(ask_saved_or_default \
   "TRAEFIK_VERSION" \
-  "Versão do Traefik" \
+  "Versao do Traefik" \
   "${TRAEFIK_VERSION:-$DEFAULT_TRAEFIK_VERSION}")"
 
 PORTAINER_AGENT_VERSION="$(ask_saved_or_default \
   "PORTAINER_AGENT_VERSION" \
-  "Versão do Portainer Agent" \
+  "Versao do Portainer Agent" \
   "${PORTAINER_AGENT_VERSION:-$DEFAULT_PORTAINER_AGENT_VERSION}")"
 
 if [ "$CONFIG_LOADED" = "yes" ] && [ "$FORCE_RECONFIG" != "1" ] && [ -n "${SSL_METHOD:-}" ]; then
-  echo "Usando valor salvo: Método SSL" >&2
+  echo "Usando valor salvo: Metodo SSL" >&2
   SSL_METHOD="${SSL_METHOD}"
 else
   SSL_METHOD="$(ask_ssl_method)"
@@ -1086,7 +1003,7 @@ CLOUDFLARE_DNS_API_TOKEN="${CLOUDFLARE_DNS_API_TOKEN:-}"
 
 if [ "$SSL_METHOD" = "cloudflare" ]; then
   echo ""
-  echo "Configuração Cloudflare"
+  echo "Configuracao Cloudflare"
 
   CLOUDFLARE_EMAIL="$(ask_saved_or_default \
     "CLOUDFLARE_EMAIL" \
@@ -1142,16 +1059,15 @@ save_config
 
 echo ""
 echo "============================================================"
-echo " ETAPA 2: INSTALAÇÃO"
+echo " ETAPA 2: INSTALACAO"
 echo "============================================================"
 
 echo ""
 echo "[1/12] Atualizando pacotes..."
-
 run_apt_update
 
 echo ""
-echo "[2/12] Instalando dependências básicas..."
+echo "[2/12] Instalando dependencias basicas..."
 
 apt-get install -y \
   ca-certificates \
@@ -1209,7 +1125,7 @@ collect_main_server_data
 test_main_server_ssh
 
 echo ""
-echo "Buscando ou criando AGENT_SECRET no servidor principal..."
+echo "Buscando AGENT_SECRET no servidor principal..."
 
 if ! AGENT_SECRET="$(fetch_or_create_agent_secret_on_principal)"; then
   echo "ERRO: falha ao buscar/criar AGENT_SECRET no servidor principal."
@@ -1234,7 +1150,7 @@ validate_main_server_can_reach_agent
 
 echo ""
 echo "============================================================"
-echo " INSTALAÇÃO FINALIZADA"
+echo " INSTALACAO FINALIZADA"
 echo "============================================================"
 echo ""
 echo "Servidor Agent:"
@@ -1251,12 +1167,12 @@ echo "  Config:        $CONFIG_FILE"
 echo "  Agent Secret:  $AGENT_SECRET_FILE"
 echo "  Stack:         $STACK_DIR/docker-compose.yml"
 echo ""
-echo "Próximo passo no Portainer principal:"
+echo "Proximo passo no Portainer principal:"
 echo "  Environments > Add environment > Docker Swarm > Agent"
 echo "  URL/Endpoint: $AGENT_PUBLIC_IP:9001"
 echo ""
 echo "IMPORTANTE:"
-echo "  O AGENT_SECRET não foi exibido por segurança."
+echo "  O AGENT_SECRET nao foi exibido por seguranca."
 echo "  Ele foi salvo no servidor principal e neste Agent em:"
 echo "  /root/portainer-agent-secret.txt"
 echo ""
